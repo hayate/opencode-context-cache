@@ -177,6 +177,55 @@ export function createLogger({ env = {}, filePath, write = appendFileSync, warn 
   };
 }
 
+/** The two spellings opencode core uses, depending on provider. */
+export const CACHE_KEY_FIELDS = ["promptCacheKey", "prompt_cache_key"];
+
+const SES_PREFIXED = /^ses_[0-9a-f]{64}$/;
+
+/** Core sends the digest without the ses_ prefix on its own zen provider path. */
+export function stripSesPrefix(sessionID) {
+  return SES_PREFIXED.test(sessionID) ? sessionID.slice(4) : sessionID;
+}
+
+/**
+ * Replace a cache key field only when it still holds core's session-ID default.
+ * Field presence alone does not prove core set the value: model, agent and
+ * variant options can carry the field, and a plugin ordered before this one can
+ * add it. Matching the session ID is exact provenance, and it inherits core's
+ * whole provider table without duplicating it.
+ */
+export function applyCacheKey(output, value, sessionID) {
+  const options = output?.options;
+  if (!options || typeof options !== "object") {
+    return { appliedFields: [], foreignFields: [], reason: "invalid-options" };
+  }
+  if (typeof sessionID !== "string" || sessionID === "") {
+    return { appliedFields: [], foreignFields: [], reason: "missing-session" };
+  }
+
+  const stripped = stripSesPrefix(sessionID);
+  const appliedFields = [];
+  const foreignFields = [];
+  const replacements = {};
+
+  for (const field of CACHE_KEY_FIELDS) {
+    if (!(field in options)) continue;
+    const current = options[field];
+    if (current === sessionID || current === stripped) {
+      replacements[field] = value;
+      appliedFields.push(field);
+    } else {
+      foreignFields.push(field);
+    }
+  }
+
+  if (appliedFields.length === 0 && foreignFields.length === 0) {
+    return { appliedFields, foreignFields, reason: "no-fields" };
+  }
+  if (appliedFields.length > 0) output.options = { ...options, ...replacements };
+  return { appliedFields, foreignFields, reason: null };
+}
+
 export const OpenCodeContextCachePlugin = async (input = {}, options = {}) => {
   const env = process.env;
   const logger = createLogger({ env });
