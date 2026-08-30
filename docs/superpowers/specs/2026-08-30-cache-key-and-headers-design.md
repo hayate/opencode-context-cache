@@ -177,11 +177,48 @@ advertised "digest detection to avoid double-hashing" can never fire.
 
 The plugin remains a **single self-contained `.mjs` file**. Upstream's install
 path is "copy this one file into your plugins directory"; splitting into a
-`src/` tree would break it. The file exports its pure functions as named
-exports so tests import them directly.
+`src/` tree would break it.
 
-All state is constructed inside the plugin factory. No module-level mutable
-state.
+**The file must export exactly one value: the plugin factory.** This is a hard
+constraint imposed by opencode's loader, discovered by running the plugin under
+a real opencode rather than by any review or test. For a file-path plugin,
+opencode walks `Object.values(module)`:
+
+```js
+function Gy(x){ if (typeof x === "function") return x;
+                if (!x || typeof x !== "object" || !("server" in x)) return;
+                if (typeof x.server !== "function") return;  return x.server }
+function Wy(m){ const seen = new Set(), out = [];
+                for (const x of Object.values(m)) {
+                  if (seen.has(x)) continue; seen.add(x);
+                  const f = Gy(x);
+                  if (!f) throw TypeError("Plugin export is not a function");
+                  out.push(f); }
+                return out }
+```
+
+Two consequences. A single non-function export - one exported constant - makes
+opencode refuse the **entire plugin**. And every distinct exported *function* is
+then invoked as a plugin factory with `(PluginInput, options)`, so an exported
+`sha256` would be called as `sha256(pluginInput, options)` and its return value
+treated as a hooks object. The `{ server }` module shape does not help here; that
+path is only taken for npm-package plugins.
+
+Helpers therefore hang off the factory as a frozen `internals` property, which
+`Object.values` does not see, and tests reach them there. The three exports
+(`OpenCodeContextCachePlugin`, `EnhancedCachePlugin`, `default`) are deliberately
+the same function object, which the loader's `Set` deduplicates into one plugin.
+`test/unit/export-shape.test.mjs` reproduces the check above so this cannot
+regress.
+
+Note what happened here: exporting the helpers was itself the fix for an earlier
+review finding about testability. It made the plugin unloadable while all 57
+tests stayed green, because tests import a module the way the test needs it, not
+the way the host does.
+
+All state is constructed inside the plugin factory, and the factory body is
+wrapped so that an unexpected startup failure yields an inert plugin rather than
+a rejected promise that fails the load. No module-level mutable state.
 
 ### 3.2 Key resolution (pure)
 
@@ -265,15 +302,33 @@ reaching a third-party gateway.
 applyCacheKey(output, key, sessionID)
   -> { appliedFields: string[],
        foreignFields: string[],
+       emptyFields:   string[],
        reason: "invalid-options" | "missing-session" | "no-fields" | null }
 ```
 
 A three-value return cannot express "replaced one field and found the other
 foreign", and collapsing malformed options, a missing session ID and a genuinely
 absent field into one value makes the operator warning lie about which happened.
-The result is therefore a record: only `reason === "no-fields"` and a non-empty
-`foreignFields` warrant an operator warning; `invalid-options` and
-`missing-session` are debug-only.
+The result is therefore a record, and **every distinguished state gets its own
+accurate warning**.
+
+An earlier revision of this spec drew the wrong conclusion here: it made
+`invalid-options` and `missing-session` debug-only. That is backwards. Those two
+states cannot occur against a correct opencode, so when they do occur the shape
+upstream has changed and the plugin is permanently inert - prompt caching has
+silently reverted to a per-session key, the exact regression this plugin exists
+to prevent. Meanwhile `no-fields` warns, and it is the *benign* case (an
+Anthropic user, working as designed). Loud on the expected, silent on the
+unprecedented.
+
+The original finding was that a coarse return made the message *lie about which
+state occurred*. The fix for that is to distinguish the states, which the record
+does. Silence was never the required consequence.
+
+`emptyFields` exists for the same reason: a field present but `undefined` or
+`null` was not set by a third party, and telling the operator that "something
+else set your key" sends them hunting for a conflicting plugin that does not
+exist.
 
 Replace a cache-key field **only when its current value is provably the one
 core just put there**. Core's default is the session ID:
@@ -404,11 +459,15 @@ Per-request detail stays in the debug log. Nothing warns per request.
 | `hostname()` throws | fall back to `"unknown-host"`; key still stable per machine-user-path |
 | `userInfo()` throws | fall back to `USER`/`USERNAME`/`LOGNAME`, then `"unknown"` |
 | `worktree` and `directory` both empty | resolve to `null`; hook no-ops; core's session-ID default stands |
-| `output.options` absent or not an object | no-op; debug log |
+| `output.options` absent or not an object | no-op; one deduped warning naming a possible upstream shape change |
 | neither cache key field present | no-op; one deduped operator warning (`absent`) |
 | field present, value is not core's default | leave it; one deduped operator warning (`foreign`) |
-| field present with value `undefined` | treated as not core's default -> `foreign`, left alone |
-| `input.sessionID` missing | cannot prove provenance; no replacement; debug log |
+| field present with value `undefined` or `null` | leave it; one deduped `empty` warning, distinct from `foreign` |
+| `input.sessionID` missing | no replacement; one deduped warning naming a possible upstream rename |
+| no path derivable from `PluginInput` | inert; one deduped warning (distinct from a `scope: session` opt-out, which is silent) |
+| `user` or `host` fell back to a placeholder | key still set; one deduped warning that the key is not machine-unique |
+| `providerID` is not a string | coerced to `"unknown"`; never interpolated raw |
+| anything throws inside the factory | plugin loads inert rather than failing to load |
 | explicit override >64 chars or non-printable | hashed instead, substitution logged |
 | log file unwritable | one stderr warning, then file logging disabled |
 
