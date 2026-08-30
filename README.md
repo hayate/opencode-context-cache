@@ -1,267 +1,175 @@
 # opencode-context-cache
 
-Enhanced prompt cache and sticky session management plugin for OpenCode.
+An [opencode](https://opencode.ai) plugin that gives your sessions a **prompt
+cache key that stays stable across sessions in the same git worktree**, instead
+of opencode's default of a fresh key per session.
 
-This project provides an OpenCode plugin that generates a stable, privacy-preserving cache key and applies it consistently across providers by writing both:
+opencode derives the upstream prompt cache key from the session ID, which is new
+every session. That means each new session starts with a cold prompt cache even
+when the prompt prefix - system prompt, `AGENTS.md`, tool schemas - is
+byte-identical to the last one. This plugin replaces that value, and only that
+value, with a digest of your worktree path.
 
-- `output.options.promptCacheKey`
-- model session headers (`x-session-id`, `conversation_id`, `session_id`)
+## Breaking change in 0.2.0
 
-Observed result from a real run: input cache hit rate improved from a near-zero baseline to `97.99%` (`164736 / 168112`).
+**The plugin no longer writes the `x-session-id`, `conversation_id` or
+`session_id` headers.** If you run behind a relay or gateway that reads those
+underscore-spelled names, reconfigure it to read the headers opencode core
+already sends: `x-session-affinity` and `X-Session-Id`, both derived from the
+real session ID.
 
-## Community
+Those header names identify a *conversation*, and a project-stable value is
+wrong in them. On opencode's OpenAI/Codex path, `x-session-affinity` keys a
+WebSocket connection pool with per-conversation `busy` and `fallback` state, so
+a per-project value would make every concurrent session in a project share one
+socket, and would let one oversized message disable the fast path for all of
+them.
 
-- Discussions: https://github.com/JackDrogon/opencode-context-cache/discussions
-- Issues: https://github.com/JackDrogon/opencode-context-cache/issues
-
-## Installation
-
-### Required: explicit config loading
-
-In this repository's verified setup, the plugin only takes effect when it is listed in the
-`plugin` field of `opencode.jsonc`. Copying the file into a plugins directory alone is not
-enough in this environment.
-
-1. Put plugin file in a stable local path (example: global plugin dir):
-
-```bash
-mkdir -p ~/.config/opencode/plugins
-cp plugins/opencode-context-cache.mjs ~/.config/opencode/plugins/opencode-context-cache.mjs
-```
-
-2. Add plugin entry in `opencode.jsonc`:
-
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    "./plugins/opencode-context-cache.mjs"
-  ]
-}
-```
-
-For global config (`~/.config/opencode/opencode.jsonc`), `./plugins/...` is resolved
-relative to `~/.config/opencode/`.
-
-3. Restart OpenCode after editing config.
-
-### Activation prerequisites (important)
-
-This plugin only takes effect after OpenCode actually loads the plugin file.
-
-Required method:
-
-1. Add it explicitly in `opencode.jsonc` with the `plugin` field.
-
-`setCacheKey` / model cache flags only control cache behavior. They do not load the plugin by themselves.
-
-## Observed impact (example)
-
-Before enabling this plugin, cache hits were near zero in repeated sessions.
-
-After enabling the plugin, one observed run reported:
-
-```json
-{
-  "input_tokens": 168112,
-  "total_tokens": 173268,
-  "output_tokens": 5156,
-  "input_tokens_details": {
-    "cached_tokens": 164736
-  },
-  "output_tokens_details": {
-    "reasoning_tokens": 3698
-  }
-}
-```
-
-Derived metrics:
-
-- Input cache hit rate: `164736 / 168112 = 97.99%`
-- Uncached input tokens: `168112 - 164736 = 3376` (`2.01%`)
-- Cached input tokens reused: `164736`
-
-Interpretation:
-
-- Most prompt input was served from cache after key stabilization.
-- Compared with a near-zero-hit baseline, this indicates a major cache reuse improvement.
-- The effect is often stronger behind AI API relay/gateway services, where unstable upstream session identifiers can otherwise reduce cache reuse.
-- Actual latency/cost gains depend on model/provider pricing and cache policy.
-
-## Compatibility
-
-- Runtime: OpenCode plugin system (`chat.params` hook)
-- Provider support: provider-agnostic (works across all configured providers)
-- Module format: ESM (`.mjs`)
-
-## Exports
-
-- Default export: `OpenCodeContextCachePlugin`
-
-## Why this plugin exists
-
-OpenCode sessions can lose cache efficiency when session identifiers vary between providers, environments, or runs. This plugin standardizes cache key generation with predictable precedence and sends only a SHA256 digest upstream.
-
-## Features
-
-- Per-project cache isolation using `user@host:<absolute_cwd>` by default
-- Works with all providers (no provider-specific branching)
-- Stable cache key precedence with environment overrides
-- SHA256 hashing for privacy (raw key is not sent to server)
-- Digest detection to avoid double-hashing existing SHA256 values
-- Especially effective with AI API relay/gateway setups that benefit from stable cache/session identity
-- Optional debug logging to a local log file
-
-## OpenCode loading behavior
-
-For this project, use explicit `plugin` entry in `opencode.json` / `opencode.jsonc` as the
-source of truth. Directory auto-loading behavior may vary by runtime/version, so do not rely
-on file placement alone for activation.
-
-## Repository layout
-
-- `plugins/opencode-context-cache.mjs`: main plugin implementation
-
-## Cache key precedence
-
-The plugin resolves the raw cache key in this order:
-
-1. `OPENCODE_PROMPT_CACHE_KEY`
-2. `OPENCODE_STICKY_SESSION_ID`
-3. Auto-generated `user@host:<absolute_cwd>`
-4. Existing model headers (`x-session-id`, `conversation_id`, `session_id`)
-5. OpenCode `sessionID`
-
-Then it applies:
-
-- SHA256 hashing for normal keys
-- No re-hash if the selected key already looks like a SHA256 hex digest
-
-Result:
-
-- The server receives only the hashed value.
-- Sticky routing headers and `promptCacheKey` stay aligned.
+See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
 ## How it works
 
-The plugin registers the `chat.params` hook and:
+1. opencode core sets the prompt cache key to the current session ID.
+2. This plugin's `chat.params` hook replaces that value with
+   `sha256("<user>@<host>:<worktree>")`.
+3. It replaces the value **only if it still equals the session ID**. Anything
+   else - your own setting, a model or agent option, another plugin's value - is
+   left untouched.
 
-1. Computes the stable cache key (raw -> hashed)
-2. Sets `output.options.promptCacheKey = <hashed>`
-3. Sets model headers to the same hashed value:
-   - `x-session-id`
-   - `conversation_id`
-   - `session_id`
-4. Adds `x-cache-debug: 1` when debug mode is enabled
+That last rule is what makes the plugin provider-agnostic without carrying a
+provider table: it only ever overwrites opencode's own output, so opencode's
+decision about *whether* a given provider gets a cache key, and under which
+spelling, is inherited for free.
 
-This keeps routing and prompt cache identity aligned.
+## Install
 
-## Configuration
+### From npm
 
-OpenCode config flags (often required for expected cache behavior):
+```jsonc
+// opencode.jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-context-cache"]
+}
+```
 
-- `provider.<id>.options.setCacheKey: true`: ensures the provider layer forwards a cache key when this plugin sets `output.options.promptCacheKey`.
-- `provider.<id>.models.<id>.options.cache`: if your provider/model exposes this flag and it is set to `false`, upstream prompt caching is effectively disabled.
-- `provider.<id>.models.<id>.options.store`: this is separate from prompt caching; for example, `store: false` controls response storage and does not replace `setCacheKey`.
+### By copying the file
 
-Minimal working `opencode.jsonc` example (required explicit plugin loading + cache flags):
+```bash
+mkdir -p ~/.config/opencode/plugins
+cp plugins/opencode-context-cache.mjs ~/.config/opencode/plugins/
+```
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    "./plugins/opencode-context-cache.mjs"
-  ],
-  "provider": {
-    "openai": {
-      "options": {
-        "setCacheKey": true
-      },
-      "models": {
-        "gpt-5-3-codex-high": {
-          "options": {
-            // "cache": false,
-            // If your provider supports the cache flag, setting it to false
-            // disables upstream prompt cache reuse.
-            "store": false
-          }
-        }
-      }
-    }
-  }
+  "plugin": ["./plugins/opencode-context-cache.mjs"]
 }
 ```
 
-Do not omit the `plugin` field above in this setup.
+For the global config at `~/.config/opencode/opencode.jsonc`, a `./plugins/...`
+path resolves relative to `~/.config/opencode/`.
 
-Environment variables:
+**The `plugin` entry is required either way.** Dropping the file into a plugins
+directory does not load it. Restart opencode after editing the config.
 
-- `OPENCODE_PROMPT_CACHE_KEY`: highest-priority manual cache key override
-- `OPENCODE_STICKY_SESSION_ID`: secondary manual override
-- `OPENCODE_CONTEXT_CACHE_DEBUG`: set to `1` or `true` to enable debug logging
+## Configuration
 
-Example shell setup:
+| Variable | Default | Effect |
+|---|---|---|
+| `OPENCODE_CONTEXT_CACHE_SCOPE` | `worktree` | `worktree`, `directory`, or `session`. |
+| `OPENCODE_PROMPT_CACHE_KEY` | unset | Use this exact key instead of a derived one. |
+| `OPENCODE_STICKY_SESSION_ID` | unset | Deprecated alias for the above. Warns once. |
+| `OPENCODE_CONTEXT_CACHE_DEBUG` | unset | `1` or `true` enables the debug log. |
+| `OPENCODE_CONTEXT_CACHE_LOG` | `$XDG_STATE_HOME/opencode/context-cache.log` | Debug log location. |
 
-```bash
-export OPENCODE_CONTEXT_CACHE_DEBUG=1
-# Optional override:
-# export OPENCODE_PROMPT_CACHE_KEY="team-cache-key"
+The same settings can come from the config file:
+
+```jsonc
+{
+  "plugin": [["opencode-context-cache", { "scope": "directory" }]]
+}
 ```
 
-## Debug logging
+**Precedence:** environment variables beat plugin options, which beat defaults.
+The one exception is `scope: session`, which is parsed first and disables the
+plugin's key outright, even if an explicit key is set. It is the opt-out switch,
+so a forgotten `OPENCODE_PROMPT_CACHE_KEY` must not be able to defeat it.
 
-When debug mode is enabled, logs are appended to:
+### Choosing a scope
 
-- `context-cache.log` in the same directory as the plugin file
+`worktree` shares one key across every session inside a checkout, which is where
+the reuse is - subdirectories of one repo have identical system prompts and tool
+schemas. Separate git worktrees get separate keys, since they hold different
+branches.
 
-Log entries include timestamp, process ID, key source, and hashed output details.
-The log prefix is `[context-cache]`.
+Narrow to `directory`, or opt out with `session`, if you run many concurrent
+sessions with genuinely different prompt prefixes in one repo, or if your
+provider treats this field as a cache *lookup* key rather than a routing hint
+(DeepInfra documents it that way and suggests a per-session value).
 
-## Verify plugin is active
+## Provider support
 
-Use this checklist:
+This sets the OpenAI-family fields `promptCacheKey` and `prompt_cache_key`. It
+applies wherever opencode itself sets one: OpenAI, Azure, xAI, Mistral, Venice,
+DeepInfra, Cerebras, opencode's own provider, and anything you enable with
+`setCacheKey: true`.
 
-1. Confirm `opencode.jsonc` contains `"plugin": ["./plugins/opencode-context-cache.mjs"]`
-   (or the equivalent valid path in your setup).
-2. Start or restart OpenCode.
-3. Ensure `OPENCODE_CONTEXT_CACHE_DEBUG=1` is set.
-4. Open the log file in your plugin directory.
-5. Confirm entries like:
-   - `Plugin initialized`
-   - `Using cache key from ...`
-   - `Set final cache key (hashed): ...`
+It does **not** apply to Anthropic, which caches via `cache_control` breakpoints
+on message content and ignores a cache key entirely. With an Anthropic provider
+the plugin is inert and says so once on stderr.
 
-If these lines appear, the plugin is loaded and processing requests.
+## About the hashing
+
+The key is hashed so your local username, hostname and absolute path do not
+travel to whatever gateway you use. That is all it is for. It is not a privacy
+control: the pre-image is `user@host:/path`, and anyone who knows your username
+and hostname can enumerate candidate paths cheaply.
+
+An explicit `OPENCODE_PROMPT_CACHE_KEY` is passed through verbatim, since you
+chose it - unless it exceeds 64 characters or contains non-printable characters,
+in which case it is hashed so the provider cannot reject it.
+
+## Observed impact
+
+One run on one provider reported a 97.99% input cache hit rate
+(`164736 / 168112` tokens) after enabling a stable key, against a near-zero
+baseline before it.
+
+Treat that as an anecdote, not a benchmark: it is a single uncontrolled
+observation, with no matched workload and no repetition, and the gain depends
+entirely on how much of your prompt prefix is actually stable between sessions.
 
 ## Troubleshooting
 
-- No log file created:
-  - Check file path and permissions for the plugin directory.
-  - Confirm `OPENCODE_CONTEXT_CACHE_DEBUG` is `1` or `true`.
-- Plugin not loading:
-  - Verify filename and extension (`opencode-context-cache.mjs`).
-  - Verify `opencode.jsonc` includes a valid `plugin` entry for this file.
-  - Verify the `plugin` path is resolved relative to the config file location.
-  - Restart OpenCode after changes.
-- Unexpected cache key changes:
-  - The default key includes absolute working directory.
-  - Moving or renaming the project path changes the key.
-  - Use `OPENCODE_PROMPT_CACHE_KEY` for a fixed identity.
-- Potential duplicate execution:
-  - If your runtime also auto-loads plugin directories, avoid loading the same file twice.
+Set `OPENCODE_CONTEXT_CACHE_DEBUG=1` and read the log (path in the table above).
+A working setup logs the resolved key source at startup and one line per
+request naming the fields it applied.
 
-## Security recommendations
+Two warnings go to stderr regardless of the debug flag, once each:
 
-- Do not commit API keys to `opencode.jsonc`; prefer environment variables.
-- Treat override keys as shared identity controls and rotate them if needed.
-- Consider adding plugin log files to `.gitignore` if logs may include operational metadata.
+- **"exposes no prompt cache key field"** - opencode placed no cache key field
+  for this provider. Expected for Anthropic and anything else that does not use
+  one. If it used to work and now does not, opencode may have renamed the field.
+- **"carries a prompt cache key this plugin did not set"** - something else set
+  the key first, and the plugin left it alone. Check for a conflicting
+  `providerOptions` entry or another plugin.
 
-## Notes
+If nothing is logged at all, the plugin is not loaded: check the `plugin` entry
+in your config and restart.
 
-- The default key uses absolute working directory, so moving a project path changes the key.
-- Use an explicit override if you need stable cache identity across different paths.
-- Sharing the same override key across projects intentionally merges cache/session identity.
+## Development
+
+```bash
+npm test              # unit suite, no dependencies to install
+npm run test:integration   # opt-in; needs a local opencode binary, else skips
+```
+
+The integration suite is a compatibility gate against the real opencode binary.
+Run it before upgrading opencode: it asserts the two facts this plugin depends
+on, that the plugin factory is invoked once per project and that
+`PluginInput.worktree` is the VCS root.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. See [LICENSE](LICENSE).
