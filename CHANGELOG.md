@@ -45,7 +45,14 @@
 - Plugin `options` support, so scope and key can be set from `opencode.jsonc`.
   Environment variables take precedence over options.
 - Always-on, deduplicated operator warnings for compatibility failures, so a
-  renamed upstream field surfaces without the debug flag being on first.
+  renamed upstream field surfaces without the debug flag being on first. A
+  provider that simply has no cache key field is **not** one of those failures
+  and is silent: Anthropic and every `@ai-sdk/openai-compatible` provider
+  (DeepSeek among them) have no such setting, so warning there would fire on a
+  routine configuration and teach operators to tune out the channel. That case
+  is recorded in the debug log as `reason=no-fields`.
+- A README section stating exactly which providers the plugin does and does not
+  affect, so its scope is knowable without reading the source.
 - A `package.json`, so the plugin can be installed by npm identifier.
 - A test suite and CI.
 
