@@ -146,14 +146,34 @@ Set `OPENCODE_CONTEXT_CACHE_DEBUG=1` and read the log (path in the table above).
 A working setup logs the resolved key source at startup and one line per
 request naming the fields it applied.
 
-Two warnings go to stderr regardless of the debug flag, once each:
+Warnings go to stderr regardless of the debug flag, deduplicated to once each,
+and are mirrored into the debug log so it stays a complete record.
+
+Expected, informational:
 
 - **"exposes no prompt cache key field"** - opencode placed no cache key field
-  for this provider. Expected for Anthropic and anything else that does not use
+  for this provider. Normal for Anthropic and anything else that does not use
   one. If it used to work and now does not, opencode may have renamed the field.
 - **"carries a prompt cache key this plugin did not set"** - something else set
-  the key first, and the plugin left it alone. Check for a conflicting
+  the key first and the plugin left it alone. Check for a conflicting
   `providerOptions` entry or another plugin.
+- **"exposes ... but opencode left it empty"** - the field exists but is unset,
+  so provenance could not be confirmed. Nobody else set it; nothing to hunt for.
+
+These mean the plugin is inert and caching has reverted to a per-session key:
+
+- **"could not derive a project path"** - opencode gave no usable `worktree` or
+  `directory`. Set `OPENCODE_PROMPT_CACHE_KEY` to pin a key explicitly.
+- **"no options object to write to"** or **"no sessionID"** - these cannot happen
+  against a working opencode. If you see one, an opencode upgrade changed a
+  shape this plugin depends on. Run `npm run test:integration` against your
+  binary, and please open an issue.
+- **"falls back to unknown@unknown-host"** - the local username or hostname could
+  not be read, so the key is not unique to this machine: every host failing the
+  same way in the same project path shares it. Common in containers. Set
+  `OPENCODE_PROMPT_CACHE_KEY`.
+- **"disabled by an unexpected startup error"** - the plugin caught a startup
+  failure and loaded inert rather than breaking opencode. Please open an issue.
 
 If nothing is logged at all, the plugin is not loaded: check the `plugin` entry
 in your config and restart.
