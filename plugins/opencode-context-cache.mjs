@@ -1,337 +1,542 @@
 /**
  * opencode plugin: OpenCode Context Cache
  *
- * Features:
- * - Per-project cache isolation using absolute path with user@host prefix
- * - Support for ALL providers (not just specific ones)
- * - Debug logging to file (same directory as plugin)
- * - Smart cache key generation with multiple fallbacks
- * - Unified session header and cache key management
- * - SHA256 hashed cache key for privacy (server sees only hash)
+ * Gives opencode a prompt cache key that is stable across sessions in the same
+ * git worktree, instead of core's default of a fresh session ID per session.
  *
- * Cache Key Format (raw): {user}@{host}:{directory}
- * Cache Key Format (sent to server): SHA256(raw)
- * Example: c@my-laptop:revm -> sha256:abc123...
- *
- * Cache Key Precedence:
- * 1. OPENCODE_PROMPT_CACHE_KEY env var (manual override)
- * 2. OPENCODE_STICKY_SESSION_ID env var (manual override)
- * 3. User@Host:Directory (auto-generated)
- * 4. Model headers (x-session-id / conversation_id / session_id)
- * 5. opencode sessionID (fallback)
+ * It sets exactly one thing: the prompt cache key field opencode core has
+ * already placed in `output.options`, and only when that field still holds
+ * core's own session-ID default. It writes no headers.
  */
 
-import { hostname, userInfo } from "os";
+import { hostname, homedir, userInfo } from "os";
 import { dirname, join } from "path";
-import { appendFileSync, existsSync, mkdirSync } from "fs";
-import { fileURLToPath } from "url";
+import { appendFileSync, mkdirSync } from "fs";
 import { createHash } from "crypto";
 
-const SESSION_ID_HEADER_NAMES = ["x-session-id", "conversation_id", "session_id"];
 const PROMPT_CACHE_KEY_ENV_VAR = "OPENCODE_PROMPT_CACHE_KEY";
 const STICKY_SESSION_ID_ENV_VAR = "OPENCODE_STICKY_SESSION_ID";
-const CACHE_DEBUG_ENV_VAR = "OPENCODE_CONTEXT_CACHE_DEBUG";
+const SCOPE_ENV_VAR = "OPENCODE_CONTEXT_CACHE_SCOPE";
+const DEBUG_ENV_VAR = "OPENCODE_CONTEXT_CACHE_DEBUG";
+const LOG_PATH_ENV_VAR = "OPENCODE_CONTEXT_CACHE_LOG";
 
-// Get plugin directory (where this file is located)
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const LOG_FILE_PATH = join(__dirname, "context-cache.log");
+/** OpenAI is reported to cap prompt_cache_key at 64 characters; a sha256 hex digest is exactly 64. */
+const MAX_CACHE_KEY_LENGTH = 64;
 
-class DebugLogger {
-  constructor(logFilePath) {
-    this.logFilePath = logFilePath;
-    this.debugEnabled = null;
-    this.loggedInputStructure = false;
-    this.ensureLogDirectory();
-  }
+const SCOPES = ["worktree", "directory", "session"];
 
-  ensureLogDirectory() {
-    try {
-      const logDir = dirname(this.logFilePath);
-      if (!existsSync(logDir)) {
-        mkdirSync(logDir, { recursive: true });
-      }
-    } catch {
-      // Ignore errors, fallback will use console.
-    }
-  }
+const PRINTABLE_ASCII = /^[\x20-\x7E]+$/;
 
-  isEnabled() {
-    if (this.debugEnabled === null) {
-      this.debugEnabled =
-        process?.env?.[CACHE_DEBUG_ENV_VAR] === "1" ||
-        process?.env?.[CACHE_DEBUG_ENV_VAR] === "true";
-    }
-    return this.debugEnabled;
-  }
+/**
+ * Ceiling on distinct warning keys held per plugin instance. The error key
+ * embeds the error text so that a second, unrelated failure is not suppressed
+ * forever - which means a fault producing a unique message per request would
+ * otherwise grow the set without bound in a long-lived server.
+ */
+const WARNING_KEY_LIMIT = 64;
 
-  toLogString(value) {
-    if (typeof value !== "object" || value === null) {
-      return String(value);
-    }
-
-    try {
-      return JSON.stringify(value);
-    } catch {
-      return String(value);
-    }
-  }
-
-  log(...args) {
-    if (!this.isEnabled()) return;
-
-    const timestamp = new Date().toISOString();
-    const pid = process.pid;
-    const message = args.map((arg) => this.toLogString(arg)).join(" ");
-
-    // Keep each log entry on a single physical line.
-    const safeMessage = message.replace(/\n/g, "\\n").replace(/\r/g, "\\r");
-    const logLine = `[${timestamp}] [pid:${pid}] [context-cache] ${safeMessage}\n`;
-
-    try {
-      // O_APPEND keeps each append atomic on POSIX filesystems.
-      appendFileSync(this.logFilePath, logLine, "utf8");
-    } catch {
-      // Fallback to stderr when file append fails.
-      console.error(`[pid:${pid}] [context-cache]`, ...args);
-    }
-  }
-
-  logInputStructureOnce(input) {
-    if (this.loggedInputStructure) return;
-    this.loggedInputStructure = true;
-
-    const safeInput = {
-      hasProvider: !!input?.provider,
-      providerKeys: input?.provider ? Object.keys(input.provider) : [],
-      hasModel: !!input?.model,
-      modelKeys: input?.model ? Object.keys(input.model) : [],
-      hasSessionID: !!input?.sessionID,
-    };
-    this.log("Input structure:", safeInput);
-  }
+function sha256(value) {
+  return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-class CacheKeyResolver {
-  constructor(logger) {
-    this.logger = logger;
-  }
-
-  sha256(input) {
-    return createHash("sha256").update(input, "utf8").digest("hex");
-  }
-
-  isSha256Hex(value) {
-    if (typeof value !== "string") return false;
-    const v = value.trim();
-    if (v.length !== 64) return false;
-    return /^[a-fA-F0-9]{64}$/.test(v);
-  }
-
-  getTrimmedEnv(name) {
-    const value = process?.env?.[name];
-    return typeof value === "string" ? value.trim() : "";
-  }
-
-  getUsername() {
-    try {
-      const ui = userInfo();
-      if (ui && ui.username) {
-        return ui.username;
-      }
-    } catch {
-      // userInfo may fail in restricted environments.
-    }
-
-    return (
-      process?.env?.USER ||
-      process?.env?.USERNAME ||
-      process?.env?.LOGNAME ||
-      "unknown"
-    );
-  }
-
-  getUserHostDirectoryKey() {
-    try {
-      const user = this.getUsername();
-      const host = hostname();
-      const cwd = process.cwd();
-      return `${user}@${host}:${cwd}`;
-    } catch {
-      return null;
-    }
-  }
-
-  getSessionIdFromHeaders(input) {
-    const headers =
-      input?.model?.headers && typeof input.model.headers === "object"
-        ? input.model.headers
-        : {};
-
-    const value = SESSION_ID_HEADER_NAMES.map((key) => headers[key])
-      .find((v) => typeof v === "string" && v.trim())
-      ?.trim?.();
-
-    return value || null;
-  }
-
-  resolveCacheKey(input) {
-    let rawKey = null;
-    let source = null;
-    let alreadyHashed = false;
-
-    // 1) Explicit env override.
-    const promptCacheKey = this.getTrimmedEnv(PROMPT_CACHE_KEY_ENV_VAR);
-    if (promptCacheKey) {
-      rawKey = promptCacheKey;
-      source = PROMPT_CACHE_KEY_ENV_VAR;
-    }
-
-    // 2) Secondary env override.
-    if (!rawKey) {
-      const stickySessionKey = this.getTrimmedEnv(STICKY_SESSION_ID_ENV_VAR);
-      if (stickySessionKey) {
-        rawKey = stickySessionKey;
-        source = STICKY_SESSION_ID_ENV_VAR;
-      }
-    }
-
-    // 3) Preferred stable default.
-    if (!rawKey) {
-      const userHostDirKey = this.getUserHostDirectoryKey();
-      if (userHostDirKey) {
-        rawKey = userHostDirKey;
-        source = "user@host:directory";
-      }
-    }
-
-    // 4) Existing model headers only when no stable default exists.
-    if (!rawKey) {
-      const headerValue = this.getSessionIdFromHeaders(input);
-      if (headerValue) {
-        rawKey = headerValue;
-        source = "model headers";
-        alreadyHashed = this.isSha256Hex(rawKey);
-      }
-    }
-
-    // 5) OpenCode session fallback.
-    if (!rawKey) {
-      const sessionID = typeof input?.sessionID === "string" ? input.sessionID : "";
-      if (sessionID) {
-        rawKey = sessionID;
-        source = "opencode sessionID";
-      }
-    }
-
-    if (!rawKey) {
-      this.logger.log("No stable cache key found");
-      return null;
-    }
-
-    const hashedKey = alreadyHashed ? rawKey : this.sha256(rawKey);
-
-    if (alreadyHashed) {
-      this.logger.log("Cache key already looks hashed; skipping sha256");
-    }
-
-    this.logger.log(`Using cache key from ${source}`);
-    this.logger.log(`  Raw: ${rawKey}`);
-    this.logger.log(`  Hash: ${hashedKey}`);
-
-    return { raw: rawKey, hashed: hashedKey };
-  }
+function fingerprint(value) {
+  return sha256(value).slice(0, 8);
 }
 
-class CacheKeyApplier {
-  constructor(logger) {
-    this.logger = logger;
-  }
-
-  applyPromptCacheKey(output, cacheKey) {
-    const existingOutputOptions =
-      output?.options && typeof output.options === "object" ? output.options : {};
-
-    output.options = {
-      ...existingOutputOptions,
-      promptCacheKey: cacheKey,
-    };
-  }
-
-  applySessionHeaders(input, cacheKey) {
-    if (input?.model && typeof input.model === "object") {
-      const headers =
-        input.model.headers && typeof input.model.headers === "object"
-          ? input.model.headers
-          : (input.model.headers = {});
-
-      for (const headerKey of SESSION_ID_HEADER_NAMES) {
-        headers[headerKey] = cacheKey;
-      }
-
-      if (this.logger.isEnabled()) {
-        headers["x-cache-debug"] = "1";
-      }
-
-      this.logger.log("Set final cache key (hashed):", cacheKey);
-      return;
-    }
-
-    this.logger.log("Input model is missing or not an object, cannot set session headers");
-  }
-
-  apply(input, output, cacheKey) {
-    this.applyPromptCacheKey(output, cacheKey);
-    this.applySessionHeaders(input, cacheKey);
-  }
+function readEnv(env, name) {
+  const value = env?.[name];
+  return typeof value === "string" ? value.trim() : "";
 }
 
-class ContextCachePluginRuntime {
-  constructor({ logger, keyResolver, keyApplier }) {
-    this.logger = logger;
-    this.keyResolver = keyResolver;
-    this.keyApplier = keyApplier;
-  }
-
-  initialize() {
-    this.logger.log("Plugin initialized");
-    this.logger.log("Log file location:", this.logger.logFilePath);
-  }
-
-  handleChatParams(input, output) {
-    this.logger.logInputStructureOnce(input);
-    this.logger.log("Processing provider");
-
-    const cacheKeyInfo = this.keyResolver.resolveCacheKey(input);
-    if (!cacheKeyInfo) {
-      this.logger.log("No cache key available");
-      return;
-    }
-
-    this.keyApplier.apply(input, output, cacheKeyInfo.hashed);
-  }
+/** Paths are used verbatim: only a whitespace-only path counts as absent. */
+function usablePath(value) {
+  return typeof value === "string" && value.trim() !== "" ? value : "";
 }
 
-const logger = new DebugLogger(LOG_FILE_PATH);
-const keyResolver = new CacheKeyResolver(logger);
-const keyApplier = new CacheKeyApplier(logger);
-const runtime = new ContextCachePluginRuntime({
-  logger,
-  keyResolver,
-  keyApplier,
-});
+function isSafeOverride(value) {
+  return value.length <= MAX_CACHE_KEY_LENGTH && PRINTABLE_ASCII.test(value);
+}
 
-export const OpenCodeContextCachePlugin = async () => {
-  runtime.initialize();
+/** Single source of truth for where a scope setting may come from. */
+function scopeSetting(env, options) {
+  return readEnv(env, SCOPE_ENV_VAR) || (typeof options?.scope === "string" ? options.scope : "");
+}
 
+function parseScope(raw) {
+  const value = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (value === "") return { scope: "worktree", unknown: null };
+  if (SCOPES.includes(value)) return { scope: value, unknown: null };
+  return { scope: "worktree", unknown: value };
+}
+
+/**
+ * Guards against a degenerate "/" worktree, which would otherwise collapse
+ * every project on the machine onto a single key.
+ *
+ * Core's own project-path helper is `vcs === "git" && worktree !== "/"`. Only
+ * the second clause is reproduced here: opencode sets `worktree` to the session
+ * directory when there is no VCS, so a non-git project already falls through to
+ * the same value, and consulting `project.vcs` would add a branch with no
+ * behavioural difference.
+ */
+function selectScopePath({ scope, worktree, directory }) {
+  const tree = usablePath(worktree);
+  const dir = usablePath(directory);
+  if (scope === "session") return "";
+  if (scope === "directory") return dir;
+  if (tree && tree.trim() !== "/") return tree;
+  return dir;
+}
+
+function resolveCacheKey({ env = {}, options = {}, worktree, directory, user, host } = {}) {
+  // Scope is parsed first so that `session` is a genuine opt-out: a stale
+  // override must not be able to defeat the safety valve.
+  const { scope, unknown: unknownScope } = parseScope(scopeSetting(env, options));
+  if (scope === "session") return null;
+
+  const explicit = [
+    [readEnv(env, PROMPT_CACHE_KEY_ENV_VAR), PROMPT_CACHE_KEY_ENV_VAR, false],
+    [readEnv(env, STICKY_SESSION_ID_ENV_VAR), STICKY_SESSION_ID_ENV_VAR, true],
+    [typeof options?.cacheKey === "string" ? options.cacheKey.trim() : "", "options.cacheKey", false],
+  ].find(([raw]) => raw !== "");
+
+  if (explicit) {
+    const [raw, source, deprecated] = explicit;
+    const safe = isSafeOverride(raw);
+    return { raw, value: safe ? raw : sha256(raw), source, hashed: !safe, sensitive: true, deprecated, unknownScope };
+  }
+
+  const path = selectScopePath({ scope, worktree, directory });
+  if (!path) return null;
+
+  const raw = `${user}@${host}:${path}`;
   return {
-    "chat.params": async (input, output) => {
-      runtime.handleChatParams(input, output);
+    raw,
+    value: sha256(raw),
+    source: `user@host:${scope}`,
+    hashed: true,
+    sensitive: false,
+    deprecated: false,
+    unknownScope,
+  };
+}
+
+function getUsername({ env = process.env, readUserInfo = userInfo } = {}) {
+  try {
+    const info = readUserInfo();
+    if (info?.username) return info.username;
+  } catch {
+    // userInfo throws in some restricted environments; fall through to env.
+  }
+  return env?.USER || env?.USERNAME || env?.LOGNAME || "unknown";
+}
+
+function safeHostname({ readHostname = hostname } = {}) {
+  try {
+    return readHostname() || "unknown-host";
+  } catch {
+    return "unknown-host";
+  }
+}
+
+function safeHomedir({ readHomedir = homedir } = {}) {
+  try {
+    return readHomedir() || "";
+  } catch {
+    // homedir throws in the same restricted environments userInfo does: no HOME
+    // and a getpwuid that fails, which is an ordinary container setup.
+    return "";
+  }
+}
+
+function defaultLogPath(env = {}, home) {
+  const explicit = readEnv(env, LOG_PATH_ENV_VAR);
+  // Resolved lazily: as a default parameter this ran on every call, including
+  // when an explicit path made it irrelevant.
+  if (explicit) return explicit;
+  const stateHome = readEnv(env, "XDG_STATE_HOME") || join(home ?? safeHomedir(), ".local", "state");
+  return join(stateHome, "opencode", "context-cache.log");
+}
+
+/**
+ * A generated key built on placeholder identity is not unique to this machine:
+ * every host that fails the same way, in the same project path, derives the
+ * same key. Returns the warning text, or null when identity is sound or the
+ * key does not depend on it.
+ */
+function identityWarning({ user, host, sensitive }) {
+  if (sensitive) return null;
+  const badUser = user === "unknown";
+  const badHost = host === "unknown-host";
+  if (!badUser && !badHost) return null;
+  const missing = badUser && badHost ? "username or hostname" : badUser ? "username" : "hostname";
+  return (
+    `could not determine the local ${missing}, so the cache key falls back to ` +
+    `"${user}@${host}:<path>". Every machine with the same failure and the same project path ` +
+    `will share it. Set ${PROMPT_CACHE_KEY_ENV_VAR} to pin a distinct key.`
+  );
+}
+
+/** Stringify a thrown value that we did not create, without throwing. */
+function describeError(error) {
+  try {
+    if (error instanceof Error) return `${error.name}: ${error.message}`;
+    return String(error);
+  } catch {
+    return "unstringifiable error";
+  }
+}
+
+function safeJson(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function createLogger({ env = {}, filePath, write = appendFileSync, warn = console.warn } = {}) {
+  const flag = String(env?.[DEBUG_ENV_VAR] ?? "").trim().toLowerCase();
+  const enabled = flag === "1" || flag === "true";
+  const path = filePath ?? defaultLogPath(env);
+  const warned = new Set();
+  let overflowed = false;
+  let fileUsable = true;
+  let dirReady = false;
+
+  function emit(message) {
+    try {
+      warn(`[context-cache] ${message}`);
+      return true;
+    } catch {
+      // A failing warning sink must never escape into the request path. The
+      // caller declines to latch the key, so a sink that recovers still gets
+      // the message.
+      return false;
+    }
+  }
+
+  const api = {
+    enabled,
+    path,
+    debug(...args) {
+      if (!enabled || !fileUsable) return;
+      const body = args
+        .map((arg) => (typeof arg === "object" && arg !== null ? safeJson(arg) : String(arg)))
+        .join(" ")
+        .replace(/\r?\n/g, "\\n");
+      try {
+        if (!dirReady) {
+          mkdirSync(dirname(path), { recursive: true });
+          dirReady = true;
+        }
+        write(path, `[${new Date().toISOString()}] [pid:${process.pid}] [context-cache] ${body}\n`, "utf8");
+      } catch (error) {
+        fileUsable = false;
+        emit(
+          `cannot write debug log at ${path}: ${describeError(error)}; debug logging disabled ` +
+            "for this process. Restart opencode after fixing it to re-enable.",
+        );
+      }
+    },
+
+    /**
+     * Always on, independent of the debug flag, and deduplicated. A
+     * compatibility failure must be visible without the operator having first
+     * guessed to turn debug logging on.
+     */
+    warnOnce(key, message) {
+      if (warned.has(key)) return false;
+      if (warned.size >= WARNING_KEY_LIMIT) {
+        // Past the ceiling, stop growing the set and stop competing for stderr.
+        // Detail stays available in the debug log, which is opt-in.
+        if (!overflowed) {
+          overflowed = true;
+          emit(
+            `more than ${WARNING_KEY_LIMIT} distinct warnings; suppressing further ones on stderr. ` +
+              `Set ${DEBUG_ENV_VAR}=1 for the full record.`,
+          );
+        }
+        api.debug(`WARN (suppressed) ${message}`);
+        return false;
+      }
+      if (!emit(message)) return false;
+      warned.add(key);
+      // The always-on channel writes to stderr, which under opencode's TUI can
+      // be redrawn away. Mirror it into the durable log so an operator who
+      // turns debug on gets a complete record rather than one with the
+      // warnings missing. Called through `api`, not `this`, so a destructured
+      // `const { warnOnce } = logger` keeps working.
+      api.debug(`WARN ${message}`);
+      return true;
     },
   };
+
+  return api;
+}
+
+/** The two spellings opencode core uses, depending on provider. */
+const CACHE_KEY_FIELDS = ["promptCacheKey", "prompt_cache_key"];
+
+const SES_PREFIXED = /^ses_[0-9a-f]{64}$/;
+
+/** Core sends the digest without the ses_ prefix on its own zen provider path. */
+function stripSesPrefix(sessionID) {
+  return SES_PREFIXED.test(sessionID) ? sessionID.slice(4) : sessionID;
+}
+
+/**
+ * Replace a cache key field only when it still holds core's session-ID default.
+ * Field presence alone does not prove core set the value: model, agent and
+ * variant options can carry the field, and a plugin ordered before this one can
+ * add it. Matching the session ID is exact provenance, and it inherits core's
+ * whole provider table without duplicating it.
+ */
+function applyCacheKey(output, value, sessionID) {
+  const options = output?.options;
+  if (!options || typeof options !== "object") {
+    return { appliedFields: [], foreignFields: [], emptyFields: [], reason: "invalid-options" };
+  }
+  if (typeof sessionID !== "string" || sessionID === "") {
+    return { appliedFields: [], foreignFields: [], emptyFields: [], reason: "missing-session" };
+  }
+
+  const stripped = stripSesPrefix(sessionID);
+  const appliedFields = [];
+  const foreignFields = [];
+  const emptyFields = [];
+  const replacements = {};
+
+  for (const field of CACHE_KEY_FIELDS) {
+    // hasOwn, not `in`: the spread below copies only own properties, and a
+    // polluted Object.prototype must not look like a field opencode set.
+    if (!Object.hasOwn(options, field)) continue;
+    const current = options[field];
+    if (current === sessionID || current === stripped) {
+      replacements[field] = value;
+      appliedFields.push(field);
+    } else if (current === undefined || current === null) {
+      // Present but unset. Provenance is still unproven so we must not write,
+      // but nobody "set" this, and saying so sends the operator hunting for a
+      // conflicting plugin that does not exist.
+      emptyFields.push(field);
+    } else {
+      foreignFields.push(field);
+    }
+  }
+
+  if (appliedFields.length === 0 && foreignFields.length === 0 && emptyFields.length === 0) {
+    return { appliedFields, foreignFields, emptyFields, reason: "no-fields" };
+  }
+  if (appliedFields.length > 0) output.options = { ...options, ...replacements };
+  return { appliedFields, foreignFields, emptyFields, reason: null };
+}
+
+const OpenCodeContextCachePlugin = async (input = {}, options = {}) => {
+  // The whole factory is guarded. An unguarded throw here rejects the promise
+  // opencode is awaiting, so the plugin fails to load outright - strictly worse
+  // than loading and doing nothing.
+  try {
+    const env = process.env;
+    const logger = createLogger({ env, warn: typeof options?.warn === "function" ? options.warn : undefined });
+    const user = getUsername({ env });
+    const host = safeHostname();
+    const { scope } = parseScope(scopeSetting(env, options));
+    const resolved = resolveCacheKey({
+      env,
+      options,
+      worktree: input?.worktree,
+      directory: input?.directory,
+      user,
+      host,
+    });
+
+    if (resolved?.unknownScope) {
+      logger.warnOnce(
+        "scope",
+        `unrecognised ${SCOPE_ENV_VAR} value "${resolved.unknownScope}"; expected one of ` +
+          `${SCOPES.join(", ")}. Falling back to worktree scope.`,
+      );
+    }
+    if (resolved?.deprecated) {
+      logger.warnOnce(
+        "deprecated-env",
+        `${STICKY_SESSION_ID_ENV_VAR} is deprecated; use ${PROMPT_CACHE_KEY_ENV_VAR} instead.`,
+      );
+    }
+    const identityIssue = resolved && identityWarning({ user, host, sensitive: resolved.sensitive });
+    if (identityIssue) logger.warnOnce("identity-fallback", identityIssue);
+
+    if (!resolved) {
+      if (scope === "session") {
+        logger.debug(`${SCOPE_ENV_VAR}=session: opted out, leaving opencode's session default in place`);
+      } else {
+        // Not an opt-out: we were asked for a stable key and could not build
+        // one. Silently reverting to a per-session key is the exact regression
+        // this plugin exists to prevent.
+        logger.warnOnce(
+          "no-path",
+          `could not derive a project path from opencode's PluginInput ` +
+            `(worktree=${safeJson(input?.worktree)}, directory=${safeJson(input?.directory)}), ` +
+            `so no stable cache key was set and prompt caching stays per-session. ` +
+            `Set ${PROMPT_CACHE_KEY_ENV_VAR} to pin one explicitly.`,
+        );
+      }
+    } else {
+      logger.debug(
+        `cache key source=${resolved.source} hashed=${resolved.hashed}`,
+        // Never log the raw value of an operator-supplied override: it may carry
+        // a tenant name or a secret pasted into the env var by mistake.
+        resolved.sensitive ? `fingerprint=${fingerprint(resolved.raw)}` : `raw=${resolved.raw}`,
+      );
+    }
+
+    return {
+      "chat.params": async (hookInput, output) => {
+        if (!resolved) return;
+        let provider = "unknown";
+        try {
+          // Coerced, not just read: every use below is a template literal, and
+          // ToString on a null-prototype object or a Symbol throws.
+          const label = hookInput?.model?.providerID ?? hookInput?.provider?.info?.id;
+          provider = typeof label === "string" && label !== "" ? label : "unknown";
+
+          const { appliedFields, foreignFields, emptyFields, reason } = applyCacheKey(
+            output,
+            resolved.value,
+            hookInput?.sessionID,
+          );
+
+          // invalid-options and missing-session cannot happen against a correct
+          // opencode. When they do, the shape upstream changed and the plugin is
+          // permanently inert, so they are exactly the states that must be loud.
+          if (reason === "invalid-options") {
+            logger.warnOnce(
+              `invalid-options:${provider}`,
+              "opencode gave this hook no options object to write to, so no cache key was applied. " +
+                "This should not happen: opencode may have changed the chat.params output shape. " +
+                "Prompt caching has reverted to a per-session key.",
+            );
+          } else if (reason === "missing-session") {
+            logger.warnOnce(
+              `missing-session:${provider}`,
+              "opencode gave this hook no sessionID, so the cache key's provenance could not be " +
+                "checked and nothing was changed. This should not happen: opencode may have renamed " +
+                "the field. Prompt caching has reverted to a per-session key.",
+            );
+          } else if (reason === "no-fields") {
+            logger.warnOnce(
+              `absent:${provider}`,
+              `provider ${provider} exposes no prompt cache key field, so none was applied. ` +
+                "This is expected for providers that do not support one; if it used to work, " +
+                "opencode may have renamed the field.",
+            );
+          }
+
+          if (foreignFields.length > 0) {
+            logger.warnOnce(
+              `foreign:${provider}:${foreignFields.join(",")}`,
+              `provider ${provider} carries a prompt cache key this plugin did not set ` +
+                `(${foreignFields.join(", ")}); leaving those fields unchanged.`,
+            );
+          }
+          if (emptyFields.length > 0) {
+            logger.warnOnce(
+              `empty:${provider}:${emptyFields.join(",")}`,
+              `provider ${provider} exposes ${emptyFields.join(", ")} but opencode left it empty, ` +
+                "so provenance could not be confirmed and no key was applied. If caching used to " +
+                "work here, opencode may have changed how it seeds this field.",
+            );
+          }
+
+          // Runs for every outcome: a debug log that goes quiet on the no-fields
+          // path cannot be told apart from a hook that is not running at all.
+          logger.debug(
+            `provider=${provider} applied=[${appliedFields.join(",")}] ` +
+              `foreign=[${foreignFields.join(",")}] empty=[${emptyFields.join(",")}] ` +
+              `reason=${reason ?? "none"}`,
+          );
+        } catch (error) {
+          // Last resort. Bounded by the error text so a second, unrelated
+          // failure on the same provider is not suppressed forever, and itself
+          // wrapped because there is nothing left to fall back to.
+          try {
+            const what = describeError(error);
+            logger.warnOnce(
+              `error:${provider}:${what.slice(0, 120)}`,
+              `unexpected error applying cache key: ${what}`,
+            );
+          } catch {
+            // Nothing further to try; the request must still proceed.
+          }
+        }
+      },
+    };
+  } catch (error) {
+    try {
+      // The logger may not exist yet, so go direct - but still honour an
+      // injected sink if the caller supplied one.
+      const sink = typeof options?.warn === "function" ? options.warn : console.warn;
+      sink(`[context-cache] disabled by an unexpected startup error: ${describeError(error)}`);
+    } catch {
+      // Nothing further to try; opencode must still get a usable plugin.
+    }
+    return { "chat.params": async () => {} };
+  }
 };
 
-// Backward-compatible export alias.
-export const EnhancedCachePlugin = OpenCodeContextCachePlugin;
+/**
+ * Helpers hang off the plugin function instead of being exported.
+ *
+ * DO NOT turn these back into named exports. opencode's loader walks
+ * `Object.values(module)` and requires every value to be a function (or an
+ * object with a `server` function):
+ *
+ *   function Gy(x){ if (typeof x === "function") return x;
+ *                   if (!x || typeof x !== "object" || !("server" in x)) return;
+ *                   if (typeof x.server !== "function") return;  return x.server }
+ *   function Wy(m){ for (const x of Object.values(m)) {
+ *                     if (!Gy(x)) throw TypeError("Plugin export is not a function"); ... } }
+ *
+ * A single exported constant makes opencode refuse the whole plugin, and every
+ * distinct exported *function* is then invoked as a plugin factory - so an
+ * exported `sha256` would be called as `sha256(pluginInput, options)`. The
+ * three exports below are deliberately the same function object, which the
+ * loader deduplicates by identity into one plugin.
+ *
+ * `test/unit/export-shape.test.mjs` reproduces that check and will fail if this
+ * is undone.
+ */
+OpenCodeContextCachePlugin.internals = Object.freeze({
+  PROMPT_CACHE_KEY_ENV_VAR,
+  STICKY_SESSION_ID_ENV_VAR,
+  SCOPE_ENV_VAR,
+  DEBUG_ENV_VAR,
+  LOG_PATH_ENV_VAR,
+  MAX_CACHE_KEY_LENGTH,
+  SCOPES,
+  CACHE_KEY_FIELDS,
+  sha256,
+  fingerprint,
+  isSafeOverride,
+  scopeSetting,
+  parseScope,
+  selectScopePath,
+  resolveCacheKey,
+  getUsername,
+  safeHostname,
+  safeHomedir,
+  identityWarning,
+  defaultLogPath,
+  describeError,
+  WARNING_KEY_LIMIT,
+  createLogger,
+  stripSesPrefix,
+  applyCacheKey,
+});
 
+/** Kept so existing configs importing the old name keep working. */
+const EnhancedCachePlugin = OpenCodeContextCachePlugin;
+
+export { OpenCodeContextCachePlugin, EnhancedCachePlugin };
 export default OpenCodeContextCachePlugin;
