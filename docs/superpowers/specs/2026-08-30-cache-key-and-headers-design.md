@@ -1,7 +1,7 @@
 # Design: stable prompt cache key, without conversation-identity headers
 
 Date: 2026-08-30
-Status: approved; revised after Codex adversarial review (see section 8)
+Status: approved; revised after two Codex adversarial reviews (see section 8)
 Branch: `rework-cache-key-and-headers`
 
 ## 1. Problem
@@ -241,11 +241,19 @@ spec overclaimed by calling it "never a correctness bug". Two qualifications:
   and this design cannot claim universal safety across every backend and relay
   implementing the field.
 
-Mitigation: scope is configurable via `OPENCODE_CONTEXT_CACHE_SCOPE`
-(`worktree` | `directory` | `session`), defaulting to `worktree`. Operators
+Mitigation: scope is configurable via `OPENCODE_CONTEXT_CACHE_SCOPE`, or the
+`scope` key of the plugin's `options` object in `opencode.jsonc`, taking
+`worktree` | `directory` | `session` and defaulting to `worktree`. Operators
 running many concurrent divergent sessions, or a provider with lookup-key
-semantics, can narrow it without patching the plugin. `session` resolves to
-`null` so core's own per-session default stands untouched.
+semantics, can narrow it without patching the plugin.
+
+`session` resolves to `null` so core's own per-session default stands
+untouched, and **it is parsed before the explicit overrides, so it beats them**.
+It is the safety valve for a provider whose cache key carries stronger
+semantics than routing, and a safety valve a forgotten stale
+`OPENCODE_PROMPT_CACHE_KEY` can silently defeat is not one. An unrecognised
+scope value warns once and falls back to `worktree` rather than silently
+widening scope.
 
 Hashing is retained for the auto-generated key only, on the honest rationale
 that it keeps the local username, hostname and home directory layout from
@@ -254,8 +262,18 @@ reaching a third-party gateway.
 ### 3.3 Applying the key
 
 ```
-applyCacheKey(output, key, sessionID) -> "applied" | "absent" | "foreign"
+applyCacheKey(output, key, sessionID)
+  -> { appliedFields: string[],
+       foreignFields: string[],
+       reason: "invalid-options" | "missing-session" | "no-fields" | null }
 ```
+
+A three-value return cannot express "replaced one field and found the other
+foreign", and collapsing malformed options, a missing session ID and a genuinely
+absent field into one value makes the operator warning lie about which happened.
+The result is therefore a record: only `reason === "no-fields"` and a non-empty
+`foreignFields` warrant an operator warning; `invalid-options` and
+`missing-session` are debug-only.
 
 Replace a cache-key field **only when its current value is provably the one
 core just put there**. Core's default is the session ID:
@@ -272,9 +290,12 @@ so the provenance test is exact:
 const isCoreDefault = (v) => v === sessionID || v === stripSesPrefix(sessionID);
 ```
 
-For each of `promptCacheKey` and `prompt_cache_key`: if absent, skip. If present
-and `isCoreDefault`, replace. If present and anything else, leave it alone and
-report `foreign`.
+For each of `promptCacheKey` and `prompt_cache_key` independently: if absent,
+skip. If present and `isCoreDefault`, replace and record it in `appliedFields`.
+If present and anything else, leave it alone and record it in `foreignFields`.
+Per-field accounting matters: a request carrying core's value in one spelling and
+a third party's in the other is a real conflict, and reporting only an aggregate
+would hide it behind the successful half.
 
 An earlier draft used bare presence (`"promptCacheKey" in options`) as the
 signal. That is wrong, and the adversarial review was right to reject it:
@@ -558,3 +579,48 @@ seven-point attack list. Recorded here so a later round does not re-derive it.
 - *Provider-specific cache scope with a prompt-version component.* Declined as
   over-engineering for this plugin's purpose, and it reintroduces the provider
   table that 3.3 exists to avoid. The scope env var covers the real need.
+
+### 8.1 Second review: the implementation plan
+
+Codex reviewed the plan (job `task-mtfmc8hc-gsxi9e`, effort high). It confirmed
+the first round's findings were folded in, and found that three of them were
+folded in *nominally* rather than correctly. Folded in:
+
+- **The tri-state return could not represent the states this spec distinguishes.**
+  Malformed options, a missing session ID and a genuinely absent field all
+  returned `"absent"`, so the operator warning claimed a provider field had
+  disappeared when the real cause was something else. Section 3.3 now returns a
+  record. This is the same class of defect as the original presence check: an
+  API too narrow to carry the distinction the design depends on.
+- **A mixed core/foreign conflict was hidden**, and the plan's test blessed it.
+  Per-field accounting added.
+- **`scope: session` did not actually opt out**, because explicit overrides were
+  parsed first, contradicting this spec's own unqualified claim. Resolved in
+  3.2 by parsing scope first.
+- **"The hook never throws" was not implemented**: the provider label was read
+  outside the `try`, and the warning sink itself could throw, including from
+  inside the catch handler.
+- **The promised deprecation notice for `OPENCODE_STICKY_SESSION_ID` existed
+  only in prose**, with no code and no test.
+- **Tasks 1-3 each committed a product that would not load.** The plan now
+  requires every commit to leave a loadable plugin, with an explicit check.
+- **`node --test test/*.test.mjs` can pass with zero tests.** Codex verified on
+  Node 24 that an unmatched quoted glob exits 0 having run nothing, and the glob
+  does not expand on Windows at all. Test files are now listed explicitly.
+- Smaller: paths were being trimmed (a path may legitimately end in whitespace);
+  `withEnv` restored the environment at the first `await` rather than after the
+  body; temp directories were never cleaned up; the integration suite used fixed
+  ports, fixed sleeps, a shared output file, and never awaited process exit; and
+  the plan's claim that every row of the 3.6 error table had a test was false.
+
+Also folded in from that round: the plugin `options` argument, which opencode
+really does pass as the second parameter (`J(Z, $.options)`), is now honoured
+with env taking precedence over it; and `CHANGELOG.md` is a required deliverable
+so the breaking header removal is disclosed somewhere durable rather than only
+in a PR description.
+
+Not taken: rewriting the integration probe to drive a live provider. It asserts
+the opencode-side contract plus the key our resolver derives from it, which is
+the part that can break under an opencode upgrade; asserting provider-side cache
+behavior needs credentials and a controlled baseline, and belongs to the
+measurement work in section 7, not to a compatibility gate.
