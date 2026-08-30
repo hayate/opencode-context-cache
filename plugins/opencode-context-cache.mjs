@@ -425,11 +425,18 @@ const OpenCodeContextCachePlugin = async (input = {}, options = {}) => {
                 "the field. Prompt caching has reverted to a per-session key.",
             );
           } else if (reason === "no-fields") {
-            logger.warnOnce(
-              `absent:${provider}`,
+            // Not a fault, so not a warning. Core seeds a cache key field only
+            // for a fixed set of provider SDKs; Anthropic caches by
+            // `cache_control` breakpoint and the openai-compatible providers
+            // have no cache key in their API at all, so for those there is
+            // nothing correct to write. Warning on a routine configuration is
+            // how an operator learns to ignore the channel that also carries
+            // the states which do mean something. Kept in the debug log so
+            // "why is no key applied here" still has an answer.
+            logger.debug(
               `provider ${provider} exposes no prompt cache key field, so none was applied. ` +
-                "This is expected for providers that do not support one; if it used to work, " +
-                "opencode may have renamed the field.",
+                "This provider does not support one; if it used to work, opencode may have " +
+                "renamed the field.",
             );
           }
 

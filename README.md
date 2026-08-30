@@ -118,14 +118,33 @@ provider treats this field as a cache *lookup* key rather than a routing hint
 
 ## Provider support
 
-This sets the OpenAI-family fields `promptCacheKey` and `prompt_cache_key`. It
-applies wherever opencode itself sets one: OpenAI, Azure, xAI, Mistral, Venice,
-DeepInfra, Cerebras, opencode's own provider, and anything you enable with
-`setCacheKey: true`.
+This sets the OpenAI-family fields `promptCacheKey` and `prompt_cache_key`, and
+only where opencode core seeds one. Core picks by the provider's SDK package,
+so the list below is core's decision, not this plugin's:
 
-It does **not** apply to Anthropic, which caches via `cache_control` breakpoints
-on message content and ignores a cache key entirely. With an Anthropic provider
-the plugin is inert and says so once on stderr.
+**The key is applied for:** OpenAI, Azure, xAI, Mistral, Venice (`promptCacheKey`),
+DeepInfra, Cerebras (`prompt_cache_key`), opencode's own provider, and any
+provider you opt in with `setCacheKey: true`.
+
+**The plugin does nothing for everything else**, which is most of the catalog:
+
+- **Anthropic** caches via `cache_control` breakpoints on message content and
+  has no cache key parameter.
+- **DeepSeek and every other `@ai-sdk/openai-compatible` provider.** DeepSeek's
+  context caching is automatic and prefix-based - [enabled by default, with no
+  code change and no key to set](https://api-docs.deepseek.com/guides/kv_cache).
+  You can confirm it is working in the response's `prompt_cache_hit_tokens`.
+  Core seeds no field for these providers, so there is no correct value to write.
+
+On those providers the plugin is inert **and silent**: nothing is broken, there
+is simply no such setting to pin. Run with `OPENCODE_CONTEXT_CACHE_DEBUG=1` and
+the log says so per request (`reason=no-fields`).
+
+Do not reach for `setCacheKey: true` to force it on an openai-compatible
+provider. Core routes that flag to the *camelCase* spelling, and the
+openai-compatible SDK passes unrecognised options into the request body
+verbatim - so the wire gets a literal `"promptCacheKey"` field, which is not the
+`prompt_cache_key` an OpenAI-style API reads. It buys nothing and risks a 400.
 
 ## About the hashing
 
@@ -157,11 +176,12 @@ request naming the fields it applied.
 Warnings go to stderr regardless of the debug flag, deduplicated to once each,
 and are mirrored into the debug log so it stays a complete record.
 
+A provider that has no cache key field at all produces **no warning** - see
+[Provider support](#provider-support). It appears in the debug log only, as
+`reason=no-fields`.
+
 Expected, informational:
 
-- **"exposes no prompt cache key field"** - opencode placed no cache key field
-  for this provider. Normal for Anthropic and anything else that does not use
-  one. If it used to work and now does not, opencode may have renamed the field.
 - **"carries a prompt cache key this plugin did not set"** - something else set
   the key first and the plugin left it alone. Check for a conflicting
   `providerOptions` entry or another plugin.

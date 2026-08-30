@@ -134,9 +134,10 @@ test("warnOnce deduplicates by key and ignores the debug flag", () => {
   const warnings = [];
   const logger = createLogger({ env: {}, filePath: "/unused", warn: (m) => warnings.push(m) });
   assert.equal(logger.enabled, false, "warnings must not require the debug flag");
-  assert.equal(logger.warnOnce("absent:openai", "first"), true);
-  assert.equal(logger.warnOnce("absent:openai", "again"), false);
-  assert.equal(logger.warnOnce("absent:anthropic", "other"), true);
+  // Keys the plugin actually emits, so grepping one from a log finds its source.
+  assert.equal(logger.warnOnce("foreign:openai:promptCacheKey", "first"), true);
+  assert.equal(logger.warnOnce("foreign:openai:promptCacheKey", "again"), false);
+  assert.equal(logger.warnOnce("foreign:anthropic:promptCacheKey", "other"), true);
   assert.deepEqual(warnings, ["[context-cache] first", "[context-cache] other"]);
 });
 
