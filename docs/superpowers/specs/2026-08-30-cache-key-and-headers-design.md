@@ -1,7 +1,7 @@
 # Design: stable prompt cache key, without conversation-identity headers
 
 Date: 2026-08-30
-Status: approved, pending adversarial review
+Status: approved; revised after Codex adversarial review (see section 8)
 Branch: `rework-cache-key-and-headers`
 
 ## 1. Problem
@@ -40,8 +40,8 @@ Those are not the same kind of identifier:
 - A session/conversation ID keys **mutable server-side state**. Sharing it
   across concurrent sessions is a correctness bug.
 
-The consuming code in opencode settles it. `x-session-affinity` keys a
-WebSocket connection pool:
+One demonstrated consumer makes the cost concrete. On opencode's built-in
+OpenAI/Codex path, `x-session-affinity` keys a WebSocket connection pool:
 
 ```js
 let N = A["x-session-affinity"] ?? A["session-id"];
@@ -54,7 +54,8 @@ D.busy = true;
 D.socket = await NA(D, ...);
 ```
 
-Pinning a conversation identity to a per-directory constant would therefore:
+On that path, pinning a conversation identity to a per-directory constant
+would:
 
 1. Force every concurrent session in one project through a single socket. The
    second concurrent request observes `busy` and silently drops to the slower
@@ -63,8 +64,23 @@ Pinning a conversation identity to a per-directory constant would therefore:
    the whole directory (`MESSAGE_TOO_BIG_CLOSE_CODE` sets `D.fallback = true`),
    degrading every other session sharing that key rather than only its own.
 
+This pool is **not** universal - it does not establish behavior for Azure, xAI,
+Mistral, DeepInfra, Cerebras, or third-party relays. It is an existence proof
+that the cost is real, not the whole argument. The general argument is that
+these header names mean "this conversation", so a project-stable value is
+semantically wrong in them whoever consumes it, and core already sends
+`x-session-affinity` and `X-Session-Id` derived from the real session ID, which
+makes the plugin's versions redundant where they are understood at all.
+
 **Decision: the plugin stops writing conversation-identity headers entirely.**
 It sets only the prompt cache key.
+
+**This is a breaking change.** The current README advertises sticky-session
+headers for relay/gateway use, including the non-standard `conversation_id` and
+`session_id` names. A gateway parsing those underscore names loses them. This
+must be called out in the README, the changelog and the upstream PR rather than
+shipped quietly; the replacement guidance is that core's own
+`x-session-affinity` / `X-Session-Id` already carry per-session identity.
 
 ### 2.2 The headers it writes collide with core's
 
@@ -106,10 +122,26 @@ Resolved by 2.1.
 type PluginInput = { client, project, directory: string, worktree: string, serverUrl, $ }
 ```
 
-`getUserHostDirectoryKey()` calls `process.cwd()` instead. Combined with
-module-level singletons constructed outside the plugin factory, any deployment
-where one server process serves more than one project collapses every project
-onto a single cache identity.
+`getUserHostDirectoryKey()` calls `process.cwd()` instead.
+
+This was verified empirically rather than inferred. A probe plugin recording its
+`PluginInput`, loaded into one `opencode serve` process started from
+`/home/andrea` and then asked for two separate projects, produced:
+
+```
+--- invocation 1 ---            --- invocation 2 ---
+  directory: .../probe            directory: .../probe2
+  worktree:  .../probe            worktree:  .../probe2
+  cwd:       /home/andrea         cwd:       /home/andrea
+```
+
+So the factory is invoked once per project with correct per-project values,
+while `process.cwd()` is the server's launch directory for both. Upstream
+therefore computes the identical key `andrea@host:/home/andrea` for two
+unrelated projects, collapsing them onto one cache identity. The same probe
+confirms `worktree` is populated and is the VCS root, and that a session started
+in a nested subdirectory reports that subdirectory as `directory` while still
+reporting the repo root as `worktree`.
 
 ### 2.5 Two of five documented precedence levels are unreachable
 
@@ -173,18 +205,47 @@ Precedence:
 
 Two changes from upstream:
 
-- **Explicit overrides are never hashed.** The operator chose that string; they
-  get that string. This deletes the `isSha256Hex` digest-sniffing branch.
+- **Explicit overrides are used verbatim when safe.** The operator chose that
+  string; they get that string. This deletes the `isSha256Hex` digest-sniffing
+  branch. "Safe" means at most 64 characters and printable ASCII: OpenAI is
+  reported to cap `prompt_cache_key` at 64 characters (not verified against a
+  live API here, so treated as a cheap defensive bound rather than an
+  established fact), and a sha256 hex digest is exactly 64. An override that
+  exceeds the bound or carries non-printable characters is hashed instead, and
+  the substitution is logged, so the plugin can never emit a value the provider
+  will reject.
 - **Level 4 is reachable.** opencode can pass `worktree: ""` (observed in the
   binary: `worktree:"",directory:j.directory??""`), so "no key available" is a
   real state with a real test, not dead code.
 
-Scope is the **worktree**, falling back to `directory` when empty. All sessions
+Scope is the **worktree**, falling back to `directory` when the worktree is
+empty or `"/"`. That guard mirrors opencode's own, which picks a project path
+with `e.vcs === "git" && e.worktree !== "/" ? e.worktree : e.directory` - a
+degenerate `/` worktree would otherwise collapse every project on the machine
+onto a single key, which is the exact bug class this change exists to fix. All sessions
 inside one checkout share a key, which is where the reuse is: the system
 prompt, AGENTS.md/CLAUDE.md and tool schemas are identical across
 subdirectories. Separate git worktrees get separate keys, which is correct
-since they hold different branches. An over-broad key can only cause a miss,
-never a correctness bug, now that no mutable state hangs off it.
+since they hold different branches.
+
+An over-broad key is low-risk but not risk-free, and the earlier draft of this
+spec overclaimed by calling it "never a correctness bug". Two qualifications:
+
+- For OpenAI, `prompt_cache_key` is a routing hint and exact prefix matching
+  protects correctness, so the failure mode is degraded hit rate rather than
+  wrong output. But concurrent agents in one worktree can hold unrelated system
+  prompts and tool sets, and OpenAI's own guidance is to split a busy group when
+  hit rate degrades. Cache thrash under concurrency is a real cost.
+- DeepInfra documents `prompt_cache_key` as an explicit KV-cache lookup key and
+  suggests a per-session value. That is a stronger contract than "routing hint",
+  and this design cannot claim universal safety across every backend and relay
+  implementing the field.
+
+Mitigation: scope is configurable via `OPENCODE_CONTEXT_CACHE_SCOPE`
+(`worktree` | `directory` | `session`), defaulting to `worktree`. Operators
+running many concurrent divergent sessions, or a provider with lookup-key
+semantics, can narrow it without patching the plugin. `session` resolves to
+`null` so core's own per-session default stands untouched.
 
 Hashing is retained for the auto-generated key only, on the honest rationale
 that it keeps the local username, hostname and home directory layout from
@@ -193,37 +254,76 @@ reaching a third-party gateway.
 ### 3.3 Applying the key
 
 ```
-applyCacheKey(options, key) -> boolean   // mutates `options` in place, returns whether it applied
+applyCacheKey(output, key, sessionID) -> "applied" | "absent" | "foreign"
 ```
+
+Replace a cache-key field **only when its current value is provably the one
+core just put there**. Core's default is the session ID:
 
 ```js
-if ("promptCacheKey"   in options) { options.promptCacheKey   = key; applied = true }
-if ("prompt_cache_key" in options) { options.prompt_cache_key = key; applied = true }
+Z.prompt_cache_key = $.sessionID;                      // deepinfra, cerebras
+Z.promptCacheKey   = $.sessionID;                      // openai, azure, xai, mistral, venice, setCacheKey:true
+Z.promptCacheKey   = /^ses_[0-9a-f]{64}$/.test(id) ? id.slice(4) : id;   // opencode zen path
 ```
 
-**Only replace a field core already placed.** This inherits core's entire
-provider table and opt-in logic rather than duplicating a table that will drift
-as opencode adds providers:
+so the provenance test is exact:
 
-- `setCacheKey: false` is respected automatically - core places no field, so we
-  place none.
-- `setCacheKey: true` on an exotic relay makes core place `promptCacheKey`, and
-  we swap in the stable value.
-- deepinfra and cerebras get `prompt_cache_key`, which upstream misses entirely
-  by hardcoding the camelCase name.
+```js
+const isCoreDefault = (v) => v === sessionID || v === stripSesPrefix(sessionID);
+```
+
+For each of `promptCacheKey` and `prompt_cache_key`: if absent, skip. If present
+and `isCoreDefault`, replace. If present and anything else, leave it alone and
+report `foreign`.
+
+An earlier draft used bare presence (`"promptCacheKey" in options`) as the
+signal. That is wrong, and the adversarial review was right to reject it:
+presence does not prove core set the value. Model, agent or variant options can
+carry the field; a plugin ordered before this one can add it; a merge can leave
+it present with value `undefined`. Overwriting on presence alone would defeat an
+explicit operator setting and make behavior depend on plugin order.
+
+Matching against the session ID fixes that precisely, and keeps the property
+that made the presence check attractive in the first place: no provider table to
+duplicate and no drift as opencode adds providers. It inherits core's entire
+opt-in decision tree, because we only ever replace core's own output.
+
+- `setCacheKey: false` -> core writes nothing -> nothing to match -> we skip.
+- `setCacheKey: true` on a relay -> core writes the session ID -> we replace it.
+- deepinfra/cerebras -> core writes `prompt_cache_key` -> we replace that name,
+  which upstream misses entirely by hardcoding the camelCase spelling.
+- A user or plugin set their own key -> not the session ID -> untouched.
+
+**Replacement, not in-place mutation.** `output.options` is reassigned to a new
+object rather than mutated:
+
+```js
+output.options = { ...options, ...replacements };
+```
+
+The review established that core builds a fresh options object per request via a
+non-mutating merge, so in-place mutation would be safe today. Replacement is
+kept anyway because it is free and stays correct if that ever changes: `_y()`
+returns `Object.values(model.variants)[0]` directly on its fallthrough path, and
+nothing in the plugin should be one refactor away from writing a cache key into
+shared model config. That is the same bug class as upstream's `model.headers`
+mutation, and it is not worth being clever about.
 
 This depends on core populating `output.options` before triggering the hook,
-which is verified:
+which is verified - `Plugin.trigger` passes the caller's output object straight
+through to every hook and returns it unchanged:
 
 ```js
-plugin.trigger("chat.params",
-  { sessionID, agent, model, provider, message },
-  { temperature, topP, topK, maxOutputTokens, options: d })
+J = y.fn("Plugin.trigger")(function*(W, K, U) {
+  if (!W) return U;
+  for (let z of (yield* c0.get(X)).hooks) { let M = z[W]; if (!M) continue;
+    yield* y.promise(async () => M(K, U)); }
+  return U;
+})
 ```
 
 If that ever changes, the plugin degrades to doing nothing rather than to doing
-something wrong. `applyCacheKey` returns whether it applied, and the hook logs
-a warning when it did not, so the degradation is visible rather than silent.
+something wrong.
 
 ### 3.4 Hook wiring
 
@@ -234,9 +334,10 @@ export const OpenCodeContextCachePlugin = async ({ directory, worktree }) => {
                                      user: getUsername(), host: safeHostname() });
   // ... log resolution outcome once
   return {
-    "chat.params": async (_input, output) => {
+    "chat.params": async (input, output) => {
       if (!resolved) return;
-      if (!applyCacheKey(output.options, resolved.value)) logger.warn(...);
+      const outcome = applyCacheKey(output, resolved.value, input?.sessionID);
+      report(outcome, input);   // debug log always; one deduped operator warning, see 3.5
     },
   };
 };
@@ -254,7 +355,26 @@ The key is resolved once per plugin instance rather than per request:
 - Enabled by `OPENCODE_CONTEXT_CACHE_DEBUG` in `{1, true}`.
 - `ensureLogDirectory` becomes real (`mkdir -p` on a directory that may not exist).
 - On write failure: emit exactly one stderr warning naming the path and the
-  error, then disable logging. Not silent, and not TUI-spamming.
+  error, then disable file logging. Not silent, and not TUI-spamming.
+
+**Operator-visible warnings are a separate channel from the debug log.** The
+earlier draft claimed compatibility failures would be "visible rather than
+silent" while routing them through the debug-gated logger, which means silent by
+default - the review was right to call that a silent failure. A future opencode
+field rename could disable the plugin indefinitely with nobody noticing.
+
+So: a `console.warn` fires independently of `OPENCODE_CONTEXT_CACHE_DEBUG`,
+**deduplicated to at most one per (plugin instance, provider, category)**, for:
+
+- `absent`  - a key was resolved but neither cache-key field was present. Names
+  the provider and states that this is expected for providers that do not use a
+  prompt cache key, so an Anthropic user sees one informative line, once, and a
+  field rename is still surfaced.
+- `foreign` - a field was present but held a value that was not core's default,
+  so it was left alone. Names what was found, so an operator can tell a
+  deliberate override from a conflict.
+
+Per-request detail stays in the debug log. Nothing warns per request.
 
 ### 3.6 Error handling
 
@@ -263,9 +383,13 @@ The key is resolved once per plugin instance rather than per request:
 | `hostname()` throws | fall back to `"unknown-host"`; key still stable per machine-user-path |
 | `userInfo()` throws | fall back to `USER`/`USERNAME`/`LOGNAME`, then `"unknown"` |
 | `worktree` and `directory` both empty | resolve to `null`; hook no-ops; core's session-ID default stands |
-| `output.options` absent or not an object | no-op; log a warning |
-| neither cache key field present | no-op; log a warning naming the provider |
-| log file unwritable | one stderr warning, then logging disabled |
+| `output.options` absent or not an object | no-op; debug log |
+| neither cache key field present | no-op; one deduped operator warning (`absent`) |
+| field present, value is not core's default | leave it; one deduped operator warning (`foreign`) |
+| field present with value `undefined` | treated as not core's default -> `foreign`, left alone |
+| `input.sessionID` missing | cannot prove provenance; no replacement; debug log |
+| explicit override >64 chars or non-printable | hashed instead, substitution logged |
+| log file unwritable | one stderr warning, then file logging disabled |
 
 The plugin never throws out of the hook. A cache-key optimization must not be
 able to fail a user's request.
@@ -274,45 +398,98 @@ able to fail a user's request.
 
 `node --test`, zero devDependencies, so CI runs with no install step.
 
-**`resolveCacheKey`**
+The review's sharpest criticism of the first draft was that most listed tests
+would pass an implementation whose hook never runs. Unit tests of the pure
+helpers are necessary but not sufficient; the suite must drive the real exported
+factory and the hook it returns.
+
+**`resolveCacheKey` (pure)**
 - each precedence level selects the expected source
 - `OPENCODE_PROMPT_CACHE_KEY` wins over `OPENCODE_STICKY_SESSION_ID`
-- explicit overrides are returned verbatim, not hashed
+- safe explicit overrides returned verbatim, not hashed
+- an override >64 chars is hashed instead, and reports that it was
+- an override with non-printable characters is hashed instead
 - whitespace-only env values are ignored, not treated as a key
 - auto key is sha256 of `user@host:path`
-- worktree preferred over directory; directory used when worktree is `""`
-- returns `null` when both are `""`
-- deterministic across calls; differs across differing user, host, or path
+- worktree preferred; directory used when worktree is `""` or `"/"`
+  (mirrors core's own `e.vcs === "git" && e.worktree !== "/"` guard, so a
+  degenerate `/` worktree cannot collapse every project onto one key)
+- `OPENCODE_CONTEXT_CACHE_SCOPE` of `directory` forces directory scope;
+  `session` resolves to `null`
+- returns `null` when both paths are empty
+- deterministic; differs across differing user, host, or path
 
-**`applyCacheKey`**
-- replaces `promptCacheKey` when present
-- replaces `prompt_cache_key` when present
-- replaces both when both present
-- adds nothing when neither is present, and returns `false`
+**`applyCacheKey` (pure, provenance)**
+- replaces `promptCacheKey` when it equals `sessionID`
+- replaces `prompt_cache_key` when it equals `sessionID`
+- replaces a value equal to the `ses_`-stripped session ID (zen path)
+- returns `foreign` and changes nothing when the value is a third party's key
+- returns `foreign` and changes nothing when the value is `undefined`
+- returns `absent` and adds nothing when neither field is present
 - leaves unrelated options untouched
+- does not mutate the object it was given (asserts a new object identity)
 
-**Plugin factory (regression tests for the bugs found)**
-- two instances built with different worktrees produce different keys
-  (upstream's `process.cwd()` plus module singletons produce the same key here)
+**Hook-level tests, driving the real factory**
+
+These exist specifically to fail an implementation whose hook never runs or
+wires the wrong key.
+
+- factory returns an object exposing `chat.params`
+- invoking that hook on an options object seeded with `sessionID` yields exactly
+  the key `resolveCacheKey` would have produced for the same `PluginInput` -
+  binds the hook to the resolver, so a hook that no-ops or passes a wrong value
+  fails
+- invoking it with a foreign value leaves the options untouched
 - `input.model.headers` is deeply unchanged after the hook runs
-- `output.options` gains no new key when core placed none
-- the hook does not throw when `output.options` is missing
+- the hook does not throw when `output.options` is missing, when `input` is
+  missing, or when `sessionID` is absent
+- two factory instances built with different worktrees produce different keys,
+  and neither depends on `process.cwd()` (asserted by running the factory from a
+  third, unrelated cwd - upstream returns the same key for both here)
+
+**Warning channel**
+- `absent` and `foreign` each warn once and then stay quiet across repeated
+  hook invocations for the same provider
+- warnings fire with `OPENCODE_CONTEXT_CACHE_DEBUG` unset
+- the raw value of an explicit override never appears in any log line; only its
+  source and a short fingerprint do
 
 **Logger**
-- disabled by default
-- writes when enabled
-- an unwritable path produces one warning and does not throw
+- disabled by default; writes when enabled
+- an unwritable path produces exactly one warning and does not throw
+
+**Integration, opt-in (`test/integration/`)**
+
+Skipped automatically when no opencode binary is present, so CI stays green;
+run locally and before an opencode upgrade as a compatibility gate. This is the
+review's requested lifecycle test, and the harness is already proven: a probe
+plugin recording its `PluginInput` under `opencode serve`.
+
+- one server process, started from an unrelated cwd, serving two projects:
+  asserts the factory is invoked once per project with that project's own
+  `directory`/`worktree`, and that the resulting keys differ
+- a session started in a nested subdirectory of a repo produces the same key as
+  one started at the repo root
+- asserts `PluginInput.worktree` is still populated and is the VCS root, which
+  is the contract the whole design rests on and the thing most likely to break
+  across an opencode upgrade
+
+Note the version skew this guards against: the installed plugin types are
+1.18.21 while the binary is 1.18.25, so the compiled behavior this design was
+verified against is not fully described by the shipped type definitions.
 
 ## 5. Deliverables
 
 - rewritten `plugins/opencode-context-cache.mjs`
-- `test/*.test.mjs`
+- `test/*.test.mjs` and `test/integration/*.test.mjs` (the latter self-skipping
+  when no opencode binary is present)
 - `package.json` (`type: module`, `scripts.test`, `files`, exports)
 - `.gitignore` (log file, `node_modules`)
 - `.github/workflows/test.yml`
 - README rewritten: drop "all providers" and "privacy" claims, reframe the
-  97.99% figure as one anecdotal run, document the removal of header writing
-  and why
+  97.99% figure as one anecdotal run, document the removal of header writing as
+  a breaking change with migration guidance, and document
+  `OPENCODE_CONTEXT_CACHE_SCOPE` and `OPENCODE_CONTEXT_CACHE_LOG`
 
 ## 6. Upstream
 
@@ -327,3 +504,57 @@ asks the maintainer to accept the removal of an advertised feature.
   would destabilize this change.
 - Publishing to npm. `package.json` makes it installable; the publish decision
   is the maintainer's.
+
+## 8. Adversarial review record
+
+Codex reviewed this spec (job `task-mtflow5i-9oguil`, effort high) against a
+seven-point attack list. Recorded here so a later round does not re-derive it.
+
+**Cleared.**
+
+- *Stale key lifetime.* Feared that resolving once per factory invocation goes
+  stale if one plugin instance serves several projects or a worktree is
+  retargeted. Codex found plugin state is created via `InstanceState.make`, keyed
+  by resolved directory; `/experimental/worktree` creates a new directory-backed
+  instance and `/experimental/worktree/reset` resets git state within the same
+  directory without retargeting. Independently confirmed by the probe in 2.4.
+  Factory-time resolution stands. The residual risk - reliance on compiled
+  behavior rather than a documented contract, with types at 1.18.21 and the
+  binary at 1.18.25 - is addressed by the opt-in integration test in section 4.
+- *Shared options object.* Feared in-place mutation could leak into shared model
+  config. Codex established core builds a fresh options object per request via a
+  non-mutating merge. Replacement is retained anyway as a free hedge (3.3).
+- *JSON injection via explicit overrides.* Not a risk; serialization escapes.
+
+**Accepted and folded in.**
+
+- *Presence does not prove provenance* - the strongest finding. Rewrote 3.3 to
+  match against `sessionID` instead of testing field presence. Codex proposed a
+  maintained provider table or a presence heuristic; the session-ID match is
+  better than both, and the finding is what made it visible.
+- *Over-broad key claim overstated* - softened in 3.2, with the DeepInfra
+  lookup-key semantics and OpenAI cache-thrash concerns recorded, and
+  `OPENCODE_CONTEXT_CACHE_SCOPE` added so scope can be narrowed without a patch.
+- *Header-removal evidence too narrow* - the WebSocket pool is opencode's
+  OpenAI/Codex path, not universal. 2.1 now presents it as an existence proof
+  and rests the argument on semantic mismatch plus redundancy with core's own
+  headers, and labels the removal a breaking change with migration guidance.
+- *Unbounded verbatim overrides* - 64-character and printable-ASCII bound added,
+  falling back to hashing (3.2).
+- *Raw override in debug logs* - only source plus a short fingerprint is logged
+  for explicit overrides (3.5).
+- *"Visible rather than silent" routed through a debug-gated logger* - a
+  separate, deduplicated, always-on operator warning channel added (3.5).
+- *Tests would pass a hook that never runs* - section 4 rewritten around
+  hook-level and integration tests.
+
+**Considered and not taken.**
+
+- *Populate conversation headers from per-request `sessionID` instead of
+  removing them.* Declined: that option was explicitly weighed and rejected
+  before this spec was written, and core already emits `x-session-affinity` and
+  `X-Session-Id` from the session ID, so the plugin's versions would duplicate
+  core for every consumer that understands them.
+- *Provider-specific cache scope with a prompt-version component.* Declined as
+  over-engineering for this plugin's purpose, and it reintroduces the provider
+  table that 3.3 exists to avoid. The scope env var covers the real need.
