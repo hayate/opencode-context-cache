@@ -203,7 +203,7 @@ function createLogger({ env = {}, filePath, write = appendFileSync, warn = conso
     }
   }
 
-  return {
+  const api = {
     enabled,
     path,
     debug(...args) {
@@ -239,11 +239,14 @@ function createLogger({ env = {}, filePath, write = appendFileSync, warn = conso
       // The always-on channel writes to stderr, which under opencode's TUI can
       // be redrawn away. Mirror it into the durable log so an operator who
       // turns debug on gets a complete record rather than one with the
-      // warnings missing.
-      this.debug(`WARN ${message}`);
+      // warnings missing. Called through `api`, not `this`, so a destructured
+      // `const { warnOnce } = logger` keeps working.
+      api.debug(`WARN ${message}`);
       return true;
     },
   };
+
+  return api;
 }
 
 /** The two spellings opencode core uses, depending on provider. */
@@ -279,7 +282,9 @@ function applyCacheKey(output, value, sessionID) {
   const replacements = {};
 
   for (const field of CACHE_KEY_FIELDS) {
-    if (!(field in options)) continue;
+    // hasOwn, not `in`: the spread below copies only own properties, and a
+    // polluted Object.prototype must not look like a field opencode set.
+    if (!Object.hasOwn(options, field)) continue;
     const current = options[field];
     if (current === sessionID || current === stripped) {
       replacements[field] = value;

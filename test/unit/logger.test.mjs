@@ -139,3 +139,16 @@ test("warnOnce deduplicates by key and ignores the debug flag", () => {
   assert.equal(logger.warnOnce("absent:anthropic", "other"), true);
   assert.deepEqual(warnings, ["[context-cache] first", "[context-cache] other"]);
 });
+
+test("warnOnce still works when detached from the logger object", () => {
+  const warnings = [];
+  const path = join(tempDir(), "context-cache.log");
+  const { warnOnce } = createLogger({
+    env: { [DEBUG_ENV_VAR]: "1" },
+    filePath: path,
+    warn: (m) => warnings.push(m),
+  });
+  assert.doesNotThrow(() => warnOnce("k", "detached call"));
+  assert.deepEqual(warnings, ["[context-cache] detached call"]);
+  assert.match(readFileSync(path, "utf8"), /WARN detached call/);
+});

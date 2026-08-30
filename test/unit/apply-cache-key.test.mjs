@@ -101,3 +101,20 @@ test("replaces options rather than mutating the object it was handed", () => {
   assert.notEqual(output.options, original, "output.options should be a new object");
   assert.equal(original.promptCacheKey, SESSION, "the original object must be untouched");
 });
+
+test("a polluted Object.prototype is not mistaken for a field opencode set", () => {
+  Object.defineProperty(Object.prototype, "promptCacheKey", {
+    value: SESSION,
+    configurable: true,
+    enumerable: false,
+    writable: true,
+  });
+  try {
+    const output = { options: { store: false } };
+    const r = applyCacheKey(output, KEY, SESSION);
+    assert.equal(r.reason, "no-fields", "an inherited property is not opencode's own output");
+    assert.equal(Object.hasOwn(output.options, "promptCacheKey"), false);
+  } finally {
+    delete Object.prototype.promptCacheKey;
+  }
+});
