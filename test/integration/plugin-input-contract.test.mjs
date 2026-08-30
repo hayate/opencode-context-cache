@@ -12,7 +12,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:net";
 import { execFileSync, spawn } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -50,8 +50,12 @@ function makeProject(root, name) {
     GIT_COMMITTER_NAME: "t",
     GIT_COMMITTER_EMAIL: "t@e",
   };
-  execFileSync("git", ["init", "-q", dir]);
-  execFileSync("git", ["-C", dir, "commit", "-q", "--allow-empty", "-m", "init"], { env: gitEnv });
+  // Isolated from the developer's global config: commit.gpgsign with an
+  // unreachable key, or a global hooksPath, otherwise fails this suite with an
+  // environment problem dressed up as an opencode contract break.
+  const isolated = ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"];
+  execFileSync("git", [...isolated, "init", "-q", dir]);
+  execFileSync("git", [...isolated, "-C", dir, "commit", "-q", "--allow-empty", "-m", "init"], { env: gitEnv });
   cpSync(join(HERE, "probe-plugin.mjs"), join(dir, "probe-plugin.mjs"));
   writeFileSync(
     join(dir, "opencode.jsonc"),
@@ -73,7 +77,7 @@ async function stop(child) {
 
 /** Boot one server, ask it for each directory, and return the probe records. */
 async function probe(directories, cwd) {
-  const root = mkdtempSync(join(tmpdir(), "ctx-cache-it-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ctx-cache-it-")));
   const out = join(root, "probe.jsonl");
   const port = await freePort();
   const stderr = [];
@@ -124,7 +128,7 @@ const keyFor = (record) =>
   }).value;
 
 test("one server process gives each project its own PluginInput", { skip }, async () => {
-  const root = mkdtempSync(join(tmpdir(), "ctx-cache-proj-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ctx-cache-proj-")));
   try {
     const a = makeProject(root, "alpha");
     const b = makeProject(root, "beta");
@@ -132,10 +136,17 @@ test("one server process gives each project its own PluginInput", { skip }, asyn
     // reading process.cwd() is demonstrably wrong.
     const records = await probe([a, b], root);
 
-    const forA = records.filter((r) => r.worktree === a);
-    const forB = records.filter((r) => r.worktree === b);
-    assert.equal(forA.length, 1, "expected exactly one plugin invocation for alpha");
-    assert.equal(forB.length, 1, "expected exactly one plugin invocation for beta");
+    assert.ok(
+      records.length > 0,
+      "the probe plugin did not load at all - check the opencode.jsonc plugin key and the " +
+        "x-opencode-directory header before concluding the plugin lifecycle changed",
+    );
+    const forA = records.filter((r) => r.kind === "factory" && r.worktree === a);
+    const forB = records.filter((r) => r.kind === "factory" && r.worktree === b);
+    // At least once, not exactly once: nothing in the design depends on the
+    // invocation count, only on each project getting its own input.
+    assert.ok(forA.length >= 1, "expected a plugin invocation for alpha");
+    assert.ok(forB.length >= 1, "expected a plugin invocation for beta");
     assert.equal(forA[0].cwd, forB[0].cwd, "both invocations share one process cwd");
     assert.notEqual(forA[0].cwd, forA[0].worktree, "process.cwd() is not the project path");
 
@@ -148,14 +159,19 @@ test("one server process gives each project its own PluginInput", { skip }, asyn
 });
 
 test("worktree is the VCS root, and a nested session shares the root's key", { skip }, async () => {
-  const root = mkdtempSync(join(tmpdir(), "ctx-cache-proj-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ctx-cache-proj-")));
   try {
     const project = makeProject(root, "gamma");
     const nested = join(project, "pkg", "deep");
     const records = await probe([project, nested], root);
 
-    const atRoot = records.find((r) => r.directory === project);
-    const atNested = records.find((r) => r.directory === nested);
+    assert.ok(
+      records.length > 0,
+      "the probe plugin did not load at all - check the opencode.jsonc plugin key and the " +
+        "x-opencode-directory header before concluding the plugin lifecycle changed",
+    );
+    const atRoot = records.find((r) => r.kind === "factory" && r.directory === project);
+    const atNested = records.find((r) => r.kind === "factory" && r.directory === nested);
     assert.ok(atRoot && atNested, "expected an invocation for both the root and the nested directory");
     assert.equal(atNested.hasWorktree, true, "PluginInput.worktree must exist");
     assert.equal(atNested.worktree, project, "worktree must be the git root, not the cwd");

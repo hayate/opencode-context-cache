@@ -27,6 +27,14 @@ const SCOPES = ["worktree", "directory", "session"];
 
 const PRINTABLE_ASCII = /^[\x20-\x7E]+$/;
 
+/**
+ * Ceiling on distinct warning keys held per plugin instance. The error key
+ * embeds the error text so that a second, unrelated failure is not suppressed
+ * forever - which means a fault producing a unique message per request would
+ * otherwise grow the set without bound in a long-lived server.
+ */
+const WARNING_KEY_LIMIT = 64;
+
 function sha256(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
@@ -62,10 +70,14 @@ function parseScope(raw) {
 }
 
 /**
- * Mirrors core's own project-path guard:
- *   vcs === "git" && worktree !== "/" ? worktree : directory
- * A degenerate "/" worktree would otherwise collapse every project on the
- * machine onto a single key.
+ * Guards against a degenerate "/" worktree, which would otherwise collapse
+ * every project on the machine onto a single key.
+ *
+ * Core's own project-path helper is `vcs === "git" && worktree !== "/"`. Only
+ * the second clause is reproduced here: opencode sets `worktree` to the session
+ * directory when there is no VCS, so a non-git project already falls through to
+ * the same value, and consulting `project.vcs` would add a branch with no
+ * behavioural difference.
  */
 function selectScopePath({ scope, worktree, directory }) {
   const tree = usablePath(worktree);
@@ -188,6 +200,7 @@ function createLogger({ env = {}, filePath, write = appendFileSync, warn = conso
   const enabled = flag === "1" || flag === "true";
   const path = filePath ?? defaultLogPath(env);
   const warned = new Set();
+  let overflowed = false;
   let fileUsable = true;
   let dirReady = false;
 
@@ -234,6 +247,19 @@ function createLogger({ env = {}, filePath, write = appendFileSync, warn = conso
      */
     warnOnce(key, message) {
       if (warned.has(key)) return false;
+      if (warned.size >= WARNING_KEY_LIMIT) {
+        // Past the ceiling, stop growing the set and stop competing for stderr.
+        // Detail stays available in the debug log, which is opt-in.
+        if (!overflowed) {
+          overflowed = true;
+          emit(
+            `more than ${WARNING_KEY_LIMIT} distinct warnings; suppressing further ones on stderr. ` +
+              `Set ${DEBUG_ENV_VAR}=1 for the full record.`,
+          );
+        }
+        api.debug(`WARN (suppressed) ${message}`);
+        return false;
+      }
       if (!emit(message)) return false;
       warned.add(key);
       // The always-on channel writes to stderr, which under opencode's TUI can
@@ -448,7 +474,10 @@ const OpenCodeContextCachePlugin = async (input = {}, options = {}) => {
     };
   } catch (error) {
     try {
-      console.warn(`[context-cache] disabled by an unexpected startup error: ${describeError(error)}`);
+      // The logger may not exist yet, so go direct - but still honour an
+      // injected sink if the caller supplied one.
+      const sink = typeof options?.warn === "function" ? options.warn : console.warn;
+      sink(`[context-cache] disabled by an unexpected startup error: ${describeError(error)}`);
     } catch {
       // Nothing further to try; opencode must still get a usable plugin.
     }
@@ -500,6 +529,7 @@ OpenCodeContextCachePlugin.internals = Object.freeze({
   identityWarning,
   defaultLogPath,
   describeError,
+  WARNING_KEY_LIMIT,
   createLogger,
   stripSesPrefix,
   applyCacheKey,

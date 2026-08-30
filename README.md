@@ -32,9 +32,17 @@ See [CHANGELOG.md](CHANGELOG.md) for the full list.
 1. opencode core sets the prompt cache key to the current session ID.
 2. This plugin's `chat.params` hook replaces that value with
    `sha256("<user>@<host>:<worktree>")`.
-3. It replaces the value **only if it still equals the session ID**. Anything
-   else - your own setting, a model or agent option, another plugin's value - is
-   left untouched.
+3. It replaces the value **only if it still equals the session ID**, which is
+   what opencode itself just put there. Any other value - your own setting, a
+   model or agent option, another plugin's - is left untouched.
+
+The test in step 3 is value equality, not a provenance token, because opencode
+gives the hook nothing else to go on. The one case it cannot distinguish is
+something else deliberately setting the key *to the current session ID*, which
+this plugin will then replace. That value is unguessable ahead of time and
+expresses the same intent as opencode's default, so the practical exposure is
+nil - but if you need the plugin to keep its hands off entirely, use
+`OPENCODE_CONTEXT_CACHE_SCOPE=session`.
 
 That last rule is what makes the plugin provider-agnostic without carrying a
 provider table: it only ever overwrites opencode's own output, so opencode's

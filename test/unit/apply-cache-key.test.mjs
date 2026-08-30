@@ -118,3 +118,60 @@ test("a polluted Object.prototype is not mistaken for a field opencode set", () 
     delete Object.prototype.promptCacheKey;
   }
 });
+
+test("a third party that sets the key to the session ID is indistinguishable from core", () => {
+  // Documented limitation, not an oversight: opencode gives the hook no
+  // provenance token, so value equality is the only available signal. The
+  // value is unguessable ahead of time and expresses core's own semantics.
+  // OPENCODE_CONTEXT_CACHE_SCOPE=session is the escape hatch.
+  const output = { options: { promptCacheKey: SESSION } };
+  const r = applyCacheKey(output, KEY, SESSION);
+  assert.deepEqual(r.appliedFields, ["promptCacheKey"]);
+  assert.equal(output.options.promptCacheKey, KEY);
+});
+
+test("any value that is not the session id or its stripped form is left alone", () => {
+  for (const theirs of ["ses_" + "a".repeat(63), STRIPPED.toUpperCase(), SESSION + "x", "ses_", ""]) {
+    const output = { options: { promptCacheKey: theirs } };
+    const r = applyCacheKey(output, KEY, SESSION);
+    assert.deepEqual(r.appliedFields, [], `must not claim ${JSON.stringify(theirs)} as core's`);
+    assert.equal(output.options.promptCacheKey, theirs);
+  }
+});
+
+test("an empty session id cannot prove provenance", () => {
+  const output = { options: { promptCacheKey: "" } };
+  const r = applyCacheKey(output, KEY, "");
+  assert.equal(r.reason, "missing-session", "an empty string must not match an empty field value");
+  assert.equal(output.options.promptCacheKey, "");
+});
+
+test("a non-string session id cannot prove provenance", () => {
+  for (const bad of [42, {}, null, Symbol("s")]) {
+    const output = { options: { promptCacheKey: bad } };
+    assert.equal(applyCacheKey(output, KEY, bad).reason, "missing-session");
+    assert.equal(output.options.promptCacheKey, bad);
+  }
+});
+
+test("a session id with no ses_ prefix still matches exactly", () => {
+  const plain = "plain-session-id";
+  const output = { options: { promptCacheKey: plain } };
+  assert.deepEqual(applyCacheKey(output, KEY, plain).appliedFields, ["promptCacheKey"]);
+  assert.equal(output.options.promptCacheKey, KEY);
+});
+
+test("snake core with a foreign camel sibling, the mirror of the tested case", () => {
+  const output = { options: { prompt_cache_key: SESSION, promptCacheKey: "theirs" } };
+  const r = applyCacheKey(output, KEY, SESSION);
+  assert.deepEqual(r.appliedFields, ["prompt_cache_key"]);
+  assert.deepEqual(r.foreignFields, ["promptCacheKey"]);
+});
+
+test("both fields foreign leaves options untouched by identity", () => {
+  const original = { promptCacheKey: "a", prompt_cache_key: "b" };
+  const output = { options: original };
+  const r = applyCacheKey(output, KEY, SESSION);
+  assert.deepEqual(r.foreignFields, ["promptCacheKey", "prompt_cache_key"]);
+  assert.equal(output.options, original, "with nothing applied there is no reason to reassign");
+});

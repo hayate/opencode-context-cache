@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 
 import plugin from "../../plugins/opencode-context-cache.mjs";
 
-const { DEBUG_ENV_VAR, LOG_PATH_ENV_VAR, createLogger, defaultLogPath, fingerprint, safeHomedir } =
+const { DEBUG_ENV_VAR, LOG_PATH_ENV_VAR, WARNING_KEY_LIMIT, createLogger, defaultLogPath, fingerprint, safeHomedir } =
   plugin.internals;
 
 const temps = [];
@@ -151,4 +151,37 @@ test("warnOnce still works when detached from the logger object", () => {
   assert.doesNotThrow(() => warnOnce("k", "detached call"));
   assert.deepEqual(warnings, ["[context-cache] detached call"]);
   assert.match(readFileSync(path, "utf8"), /WARN detached call/);
+});
+
+test("distinct warning keys are capped, so a per-request unique error cannot grow without bound", () => {
+  const warnings = [];
+  const path = join(tempDir(), "context-cache.log");
+  const logger = createLogger({
+    env: { [DEBUG_ENV_VAR]: "1" },
+    filePath: path,
+    warn: (m) => warnings.push(m),
+  });
+  for (let i = 0; i < WARNING_KEY_LIMIT * 3; i++) logger.warnOnce(`error:openai:unique-${i}`, `failure ${i}`);
+
+  assert.equal(
+    warnings.length,
+    WARNING_KEY_LIMIT + 1,
+    "every key up to the ceiling warns, then exactly one overflow notice",
+  );
+  assert.match(warnings.at(-1), /suppressing further ones on stderr/);
+
+  const log = readFileSync(path, "utf8");
+  assert.match(log, /WARN \(suppressed\) failure 191/, "detail still reaches the debug log past the ceiling");
+  assert.equal((log.match(/WARN \(suppressed\)/g) ?? []).length, WARNING_KEY_LIMIT * 2, "every suppressed warning is still recorded");
+});
+
+test("debug stringifies objects, and survives one that cannot be serialised", () => {
+  const path = join(tempDir(), "context-cache.log");
+  const logger = createLogger({ env: { [DEBUG_ENV_VAR]: "1" }, filePath: path });
+  const circular = { name: "loop" };
+  circular.self = circular;
+  logger.debug("obj", { a: 1 }, circular);
+  const body = readFileSync(path, "utf8");
+  assert.match(body, /\{"a":1\}/, "plain objects are serialised, not printed as [object Object]");
+  assert.match(body, /\[object Object\]/, "a circular object falls back to String() rather than throwing");
 });

@@ -210,3 +210,10 @@ test("scopeSetting is the single source of truth for where scope comes from", ()
   assert.equal(scopeSetting({}, { scope: 42 }), "", "a non-string option is ignored, not coerced");
   assert.equal(scopeSetting(undefined, undefined), "");
 });
+
+test("the printable-ASCII bound excludes DEL and everything above it", () => {
+  assert.equal(isSafeOverride("\x7e"), true, "tilde is the last printable character");
+  assert.equal(isSafeOverride("\x7f"), false, "DEL is not printable");
+  assert.equal(isSafeOverride("\x1f"), false);
+  assert.equal(isSafeOverride("\x20"), true, "space is printable");
+});
