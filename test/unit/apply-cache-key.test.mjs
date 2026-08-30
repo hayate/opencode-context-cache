@@ -1,7 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { applyCacheKey, stripSesPrefix } from "../../plugins/opencode-context-cache.mjs";
+import plugin from "../../plugins/opencode-context-cache.mjs";
+
+const { applyCacheKey, stripSesPrefix } = plugin.internals;
 
 const SESSION = "ses_" + "a".repeat(64);
 const STRIPPED = "a".repeat(64);

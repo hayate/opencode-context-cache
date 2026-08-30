@@ -14,24 +14,24 @@ import { dirname, join } from "path";
 import { appendFileSync, mkdirSync } from "fs";
 import { createHash } from "crypto";
 
-export const PROMPT_CACHE_KEY_ENV_VAR = "OPENCODE_PROMPT_CACHE_KEY";
-export const STICKY_SESSION_ID_ENV_VAR = "OPENCODE_STICKY_SESSION_ID";
-export const SCOPE_ENV_VAR = "OPENCODE_CONTEXT_CACHE_SCOPE";
-export const DEBUG_ENV_VAR = "OPENCODE_CONTEXT_CACHE_DEBUG";
-export const LOG_PATH_ENV_VAR = "OPENCODE_CONTEXT_CACHE_LOG";
+const PROMPT_CACHE_KEY_ENV_VAR = "OPENCODE_PROMPT_CACHE_KEY";
+const STICKY_SESSION_ID_ENV_VAR = "OPENCODE_STICKY_SESSION_ID";
+const SCOPE_ENV_VAR = "OPENCODE_CONTEXT_CACHE_SCOPE";
+const DEBUG_ENV_VAR = "OPENCODE_CONTEXT_CACHE_DEBUG";
+const LOG_PATH_ENV_VAR = "OPENCODE_CONTEXT_CACHE_LOG";
 
 /** OpenAI is reported to cap prompt_cache_key at 64 characters; a sha256 hex digest is exactly 64. */
-export const MAX_CACHE_KEY_LENGTH = 64;
+const MAX_CACHE_KEY_LENGTH = 64;
 
-export const SCOPES = ["worktree", "directory", "session"];
+const SCOPES = ["worktree", "directory", "session"];
 
 const PRINTABLE_ASCII = /^[\x20-\x7E]+$/;
 
-export function sha256(value) {
+function sha256(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-export function fingerprint(value) {
+function fingerprint(value) {
   return sha256(value).slice(0, 8);
 }
 
@@ -45,11 +45,11 @@ function usablePath(value) {
   return typeof value === "string" && value.trim() !== "" ? value : "";
 }
 
-export function isSafeOverride(value) {
+function isSafeOverride(value) {
   return value.length <= MAX_CACHE_KEY_LENGTH && PRINTABLE_ASCII.test(value);
 }
 
-export function parseScope(raw) {
+function parseScope(raw) {
   const value = typeof raw === "string" ? raw.trim().toLowerCase() : "";
   if (value === "") return { scope: "worktree", unknown: null };
   if (SCOPES.includes(value)) return { scope: value, unknown: null };
@@ -62,7 +62,7 @@ export function parseScope(raw) {
  * A degenerate "/" worktree would otherwise collapse every project on the
  * machine onto a single key.
  */
-export function selectScopePath({ scope, worktree, directory }) {
+function selectScopePath({ scope, worktree, directory }) {
   const tree = usablePath(worktree);
   const dir = usablePath(directory);
   if (scope === "session") return "";
@@ -71,7 +71,7 @@ export function selectScopePath({ scope, worktree, directory }) {
   return dir;
 }
 
-export function resolveCacheKey({ env = {}, options = {}, worktree, directory, user, host } = {}) {
+function resolveCacheKey({ env = {}, options = {}, worktree, directory, user, host } = {}) {
   // Scope is parsed first so that `session` is a genuine opt-out: a stale
   // override must not be able to defeat the safety valve.
   const { scope, unknown: unknownScope } = parseScope(
@@ -106,7 +106,7 @@ export function resolveCacheKey({ env = {}, options = {}, worktree, directory, u
   };
 }
 
-export function getUsername({ env = process.env, readUserInfo = userInfo } = {}) {
+function getUsername({ env = process.env, readUserInfo = userInfo } = {}) {
   try {
     const info = readUserInfo();
     if (info?.username) return info.username;
@@ -116,7 +116,7 @@ export function getUsername({ env = process.env, readUserInfo = userInfo } = {})
   return env?.USER || env?.USERNAME || env?.LOGNAME || "unknown";
 }
 
-export function safeHostname({ readHostname = hostname } = {}) {
+function safeHostname({ readHostname = hostname } = {}) {
   try {
     return readHostname() || "unknown-host";
   } catch {
@@ -124,7 +124,7 @@ export function safeHostname({ readHostname = hostname } = {}) {
   }
 }
 
-export function defaultLogPath(env = {}, home = homedir()) {
+function defaultLogPath(env = {}, home = homedir()) {
   const explicit = readEnv(env, LOG_PATH_ENV_VAR);
   if (explicit) return explicit;
   const stateHome = readEnv(env, "XDG_STATE_HOME") || join(home, ".local", "state");
@@ -139,7 +139,7 @@ function safeJson(value) {
   }
 }
 
-export function createLogger({ env = {}, filePath, write = appendFileSync, warn = console.warn } = {}) {
+function createLogger({ env = {}, filePath, write = appendFileSync, warn = console.warn } = {}) {
   const flag = String(env?.[DEBUG_ENV_VAR] ?? "").trim().toLowerCase();
   const enabled = flag === "1" || flag === "true";
   const path = filePath ?? defaultLogPath(env);
@@ -191,12 +191,12 @@ export function createLogger({ env = {}, filePath, write = appendFileSync, warn 
 }
 
 /** The two spellings opencode core uses, depending on provider. */
-export const CACHE_KEY_FIELDS = ["promptCacheKey", "prompt_cache_key"];
+const CACHE_KEY_FIELDS = ["promptCacheKey", "prompt_cache_key"];
 
 const SES_PREFIXED = /^ses_[0-9a-f]{64}$/;
 
 /** Core sends the digest without the ses_ prefix on its own zen provider path. */
-export function stripSesPrefix(sessionID) {
+function stripSesPrefix(sessionID) {
   return SES_PREFIXED.test(sessionID) ? sessionID.slice(4) : sessionID;
 }
 
@@ -207,7 +207,7 @@ export function stripSesPrefix(sessionID) {
  * add it. Matching the session ID is exact provenance, and it inherits core's
  * whole provider table without duplicating it.
  */
-export function applyCacheKey(output, value, sessionID) {
+function applyCacheKey(output, value, sessionID) {
   const options = output?.options;
   if (!options || typeof options !== "object") {
     return { appliedFields: [], foreignFields: [], reason: "invalid-options" };
@@ -239,7 +239,7 @@ export function applyCacheKey(output, value, sessionID) {
   return { appliedFields, foreignFields, reason: null };
 }
 
-export const OpenCodeContextCachePlugin = async (input = {}, options = {}) => {
+const OpenCodeContextCachePlugin = async (input = {}, options = {}) => {
   const env = process.env;
   const logger = createLogger({ env, warn: typeof options?.warn === "function" ? options.warn : undefined });
   const resolved = resolveCacheKey({
@@ -313,7 +313,53 @@ export const OpenCodeContextCachePlugin = async (input = {}, options = {}) => {
   };
 };
 
-/** Kept so existing configs importing the old name keep working. */
-export const EnhancedCachePlugin = OpenCodeContextCachePlugin;
+/**
+ * Helpers hang off the plugin function instead of being exported.
+ *
+ * DO NOT turn these back into named exports. opencode's loader walks
+ * `Object.values(module)` and requires every value to be a function (or an
+ * object with a `server` function):
+ *
+ *   function Gy(x){ if (typeof x === "function") return x;
+ *                   if (!x || typeof x !== "object" || !("server" in x)) return;
+ *                   if (typeof x.server !== "function") return;  return x.server }
+ *   function Wy(m){ for (const x of Object.values(m)) {
+ *                     if (!Gy(x)) throw TypeError("Plugin export is not a function"); ... } }
+ *
+ * A single exported constant makes opencode refuse the whole plugin, and every
+ * distinct exported *function* is then invoked as a plugin factory - so an
+ * exported `sha256` would be called as `sha256(pluginInput, options)`. The
+ * three exports below are deliberately the same function object, which the
+ * loader deduplicates by identity into one plugin.
+ *
+ * `test/unit/export-shape.test.mjs` reproduces that check and will fail if this
+ * is undone.
+ */
+OpenCodeContextCachePlugin.internals = Object.freeze({
+  PROMPT_CACHE_KEY_ENV_VAR,
+  STICKY_SESSION_ID_ENV_VAR,
+  SCOPE_ENV_VAR,
+  DEBUG_ENV_VAR,
+  LOG_PATH_ENV_VAR,
+  MAX_CACHE_KEY_LENGTH,
+  SCOPES,
+  CACHE_KEY_FIELDS,
+  sha256,
+  fingerprint,
+  isSafeOverride,
+  parseScope,
+  selectScopePath,
+  resolveCacheKey,
+  getUsername,
+  safeHostname,
+  defaultLogPath,
+  createLogger,
+  stripSesPrefix,
+  applyCacheKey,
+});
 
+/** Kept so existing configs importing the old name keep working. */
+const EnhancedCachePlugin = OpenCodeContextCachePlugin;
+
+export { OpenCodeContextCachePlugin, EnhancedCachePlugin };
 export default OpenCodeContextCachePlugin;

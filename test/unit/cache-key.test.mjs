@@ -2,7 +2,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 
-import {
+import plugin from "../../plugins/opencode-context-cache.mjs";
+
+// Helpers are not exported: opencode's loader would invoke each one as a
+// plugin factory. See the note beside `internals` in the plugin file.
+const {
   MAX_CACHE_KEY_LENGTH,
   PROMPT_CACHE_KEY_ENV_VAR,
   SCOPE_ENV_VAR,
@@ -14,7 +18,7 @@ import {
   safeHostname,
   selectScopePath,
   sha256,
-} from "../../plugins/opencode-context-cache.mjs";
+} = plugin.internals;
 
 const BASE = { user: "andrea", host: "moonveil", worktree: "/srv/repo", directory: "/srv/repo/pkg/a", env: {} };
 const digest = (v) => createHash("sha256").update(v, "utf8").digest("hex");

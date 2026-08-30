@@ -4,13 +4,9 @@ import { join } from "node:path";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 
-import {
-  DEBUG_ENV_VAR,
-  LOG_PATH_ENV_VAR,
-  createLogger,
-  defaultLogPath,
-  fingerprint,
-} from "../../plugins/opencode-context-cache.mjs";
+import plugin from "../../plugins/opencode-context-cache.mjs";
+
+const { DEBUG_ENV_VAR, LOG_PATH_ENV_VAR, createLogger, defaultLogPath, fingerprint } = plugin.internals;
 
 const temps = [];
 function tempDir() {

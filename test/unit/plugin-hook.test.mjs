@@ -3,15 +3,18 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 
 import OpenCodeContextCacheDefault, {
-  DEBUG_ENV_VAR,
   EnhancedCachePlugin,
   OpenCodeContextCachePlugin,
+} from "../../plugins/opencode-context-cache.mjs";
+
+const {
+  DEBUG_ENV_VAR,
   PROMPT_CACHE_KEY_ENV_VAR,
   SCOPE_ENV_VAR,
   STICKY_SESSION_ID_ENV_VAR,
   getUsername,
   safeHostname,
-} from "../../plugins/opencode-context-cache.mjs";
+} = OpenCodeContextCachePlugin.internals;
 
 const SESSION = "ses_" + "b".repeat(64);
 const digest = (v) => createHash("sha256").update(v, "utf8").digest("hex");

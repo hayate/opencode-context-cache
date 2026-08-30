@@ -18,7 +18,9 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { resolveCacheKey, getUsername, safeHostname } from "../../plugins/opencode-context-cache.mjs";
+import plugin from "../../plugins/opencode-context-cache.mjs";
+
+const { resolveCacheKey, getUsername, safeHostname } = plugin.internals;
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const BIN =
