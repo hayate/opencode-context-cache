@@ -1,0 +1,31 @@
+{
+  "name": "opencode-context-cache",
+  "version": "0.2.0",
+  "description": "Stable prompt cache key for opencode sessions, scoped to the git worktree",
+  "type": "module",
+  "main": "plugins/opencode-context-cache.mjs",
+  "exports": {
+    ".": "./plugins/opencode-context-cache.mjs"
+  },
+  "files": [
+    "plugins/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "pretest": "node scripts/check-test-files.mjs test",
+    "test": "node --test test/unit/cache-key.test.mjs",
+    "pretest:integration": "node scripts/check-test-files.mjs test:integration",
+    "test:integration": "node --test test/integration/plugin-input-contract.test.mjs"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "prompt-cache"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}
