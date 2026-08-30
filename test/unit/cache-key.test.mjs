@@ -19,6 +19,7 @@ const {
   selectScopePath,
   sha256,
   identityWarning,
+  scopeSetting,
 } = plugin.internals;
 
 const BASE = { user: "andrea", host: "moonveil", worktree: "/srv/repo", directory: "/srv/repo/pkg/a", env: {} };
@@ -200,4 +201,12 @@ test("a placeholder identity is reachable from the real fallback paths", () => {
   const user = getUsername({ env: {}, readUserInfo: boom });
   const host = safeHostname({ readHostname: boom });
   assert.notEqual(identityWarning({ user, host, sensitive: false }), null);
+});
+
+test("scopeSetting is the single source of truth for where scope comes from", () => {
+  assert.equal(scopeSetting({ [SCOPE_ENV_VAR]: "directory" }, { scope: "session" }), "directory");
+  assert.equal(scopeSetting({}, { scope: "session" }), "session");
+  assert.equal(scopeSetting({}, {}), "");
+  assert.equal(scopeSetting({}, { scope: 42 }), "", "a non-string option is ignored, not coerced");
+  assert.equal(scopeSetting(undefined, undefined), "");
 });

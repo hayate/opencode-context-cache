@@ -49,6 +49,11 @@ function isSafeOverride(value) {
   return value.length <= MAX_CACHE_KEY_LENGTH && PRINTABLE_ASCII.test(value);
 }
 
+/** Single source of truth for where a scope setting may come from. */
+function scopeSetting(env, options) {
+  return readEnv(env, SCOPE_ENV_VAR) || (typeof options?.scope === "string" ? options.scope : "");
+}
+
 function parseScope(raw) {
   const value = typeof raw === "string" ? raw.trim().toLowerCase() : "";
   if (value === "") return { scope: "worktree", unknown: null };
@@ -74,9 +79,7 @@ function selectScopePath({ scope, worktree, directory }) {
 function resolveCacheKey({ env = {}, options = {}, worktree, directory, user, host } = {}) {
   // Scope is parsed first so that `session` is a genuine opt-out: a stale
   // override must not be able to defeat the safety valve.
-  const { scope, unknown: unknownScope } = parseScope(
-    readEnv(env, SCOPE_ENV_VAR) || (typeof options?.scope === "string" ? options.scope : ""),
-  );
+  const { scope, unknown: unknownScope } = parseScope(scopeSetting(env, options));
   if (scope === "session") return null;
 
   const explicit = [
@@ -307,9 +310,7 @@ const OpenCodeContextCachePlugin = async (input = {}, options = {}) => {
     const logger = createLogger({ env, warn: typeof options?.warn === "function" ? options.warn : undefined });
     const user = getUsername({ env });
     const host = safeHostname();
-    const { scope } = parseScope(
-      readEnv(env, SCOPE_ENV_VAR) || (typeof options?.scope === "string" ? options.scope : ""),
-    );
+    const { scope } = parseScope(scopeSetting(env, options));
     const resolved = resolveCacheKey({
       env,
       options,
@@ -484,6 +485,7 @@ OpenCodeContextCachePlugin.internals = Object.freeze({
   sha256,
   fingerprint,
   isSafeOverride,
+  scopeSetting,
   parseScope,
   selectScopePath,
   resolveCacheKey,
