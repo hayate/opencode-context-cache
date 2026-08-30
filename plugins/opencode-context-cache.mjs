@@ -143,6 +143,7 @@ export function createLogger({ env = {}, filePath, write = appendFileSync, warn 
   const flag = String(env?.[DEBUG_ENV_VAR] ?? "").trim().toLowerCase();
   const enabled = flag === "1" || flag === "true";
   const path = filePath ?? defaultLogPath(env);
+  const warned = new Set();
   let fileUsable = true;
   let dirReady = false;
 
@@ -173,6 +174,18 @@ export function createLogger({ env = {}, filePath, write = appendFileSync, warn 
         fileUsable = false;
         emit(`cannot write debug log at ${path}: ${error?.message ?? error}; debug logging disabled`);
       }
+    },
+
+    /**
+     * Always on, independent of the debug flag, and deduplicated. A
+     * compatibility failure must be visible without the operator having first
+     * guessed to turn debug logging on.
+     */
+    warnOnce(key, message) {
+      if (warned.has(key)) return false;
+      warned.add(key);
+      emit(message);
+      return true;
     },
   };
 }
