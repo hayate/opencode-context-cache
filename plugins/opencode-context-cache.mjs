@@ -241,7 +241,7 @@ export function applyCacheKey(output, value, sessionID) {
 
 export const OpenCodeContextCachePlugin = async (input = {}, options = {}) => {
   const env = process.env;
-  const logger = createLogger({ env });
+  const logger = createLogger({ env, warn: typeof options?.warn === "function" ? options.warn : undefined });
   const resolved = resolveCacheKey({
     env,
     options,
@@ -250,6 +250,20 @@ export const OpenCodeContextCachePlugin = async (input = {}, options = {}) => {
     user: getUsername({ env }),
     host: safeHostname(),
   });
+
+  if (resolved?.unknownScope) {
+    logger.warnOnce(
+      "scope",
+      `unrecognised ${SCOPE_ENV_VAR} value "${resolved.unknownScope}"; expected one of ` +
+        `${SCOPES.join(", ")}. Falling back to worktree scope.`,
+    );
+  }
+  if (resolved?.deprecated) {
+    logger.warnOnce(
+      "deprecated-env",
+      `${STICKY_SESSION_ID_ENV_VAR} is deprecated; use ${PROMPT_CACHE_KEY_ENV_VAR} instead.`,
+    );
+  }
 
   if (!resolved) logger.debug("no stable cache key resolved; leaving opencode's session default in place");
   else {
@@ -262,8 +276,40 @@ export const OpenCodeContextCachePlugin = async (input = {}, options = {}) => {
   }
 
   return {
-    // Applying the key is wired in Task 4. This keeps the plugin loadable.
-    "chat.params": async () => {},
+    "chat.params": async (hookInput, output) => {
+      if (!resolved) return;
+      // Everything, including reading the provider label off possibly hostile
+      // input, sits inside the try. A cache optimization must never be able to
+      // fail the user's request.
+      let provider = "unknown";
+      try {
+        provider = hookInput?.model?.providerID ?? hookInput?.provider?.info?.id ?? "unknown";
+        const { appliedFields, foreignFields, reason } = applyCacheKey(output, resolved.value, hookInput?.sessionID);
+
+        if (foreignFields.length > 0) {
+          logger.warnOnce(
+            `foreign:${provider}:${foreignFields.join(",")}`,
+            `provider ${provider} carries a prompt cache key this plugin did not set ` +
+              `(${foreignFields.join(", ")}); leaving those fields unchanged.`,
+          );
+        }
+        if (reason === "no-fields") {
+          logger.warnOnce(
+            `absent:${provider}`,
+            `provider ${provider} exposes no prompt cache key field, so none was applied. ` +
+              "This is expected for providers that do not support one; if it used to work, " +
+              "opencode may have renamed the field.",
+          );
+          return;
+        }
+        logger.debug(
+          `provider=${provider} applied=[${appliedFields.join(",")}] ` +
+            `foreign=[${foreignFields.join(",")}] reason=${reason ?? "none"}`,
+        );
+      } catch (error) {
+        logger.warnOnce(`error:${provider}`, `unexpected error applying cache key: ${error?.stack ?? error}`);
+      }
+    },
   };
 };
 

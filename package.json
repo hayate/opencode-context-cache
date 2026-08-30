@@ -15,7 +15,7 @@
   ],
   "scripts": {
     "pretest": "node scripts/check-test-files.mjs test",
-    "test": "node --test test/unit/cache-key.test.mjs test/unit/apply-cache-key.test.mjs test/unit/logger.test.mjs",
+    "test": "node --test test/unit/cache-key.test.mjs test/unit/apply-cache-key.test.mjs test/unit/logger.test.mjs test/unit/plugin-hook.test.mjs",
     "pretest:integration": "node scripts/check-test-files.mjs test:integration",
     "test:integration": "node --test test/integration/plugin-input-contract.test.mjs"
   },
