@@ -197,20 +197,44 @@ test("a nested directory shares the key of its worktree root", async () => {
   });
 });
 
-test("a missing cache key field warns once per provider, with debug off", async () => {
+test("a provider with no cache key field stays silent on stderr", async () => {
+  // The common case, not a fault: Anthropic caches with `cache_control`
+  // breakpoints and every @ai-sdk/openai-compatible provider - DeepSeek among
+  // them - has no cache key in its API at all, so core seeds no field and there
+  // is nothing correct to write. Warning here fires on a routine config and
+  // teaches operators to tune out the channel that carries the states which do
+  // mean something.
   await withEnv({}, async () => {
     const warnings = [];
     const hooks = await OpenCodeContextCachePlugin(
       { directory: "/srv/repo", worktree: "/srv/repo" },
       { warn: (m) => warnings.push(m) },
     );
-    await hooks["chat.params"](hookInput(), { options: {} });
-    await hooks["chat.params"](hookInput(), { options: {} });
+    await hooks["chat.params"](hookInput({ model: { providerID: "deepseek" } }), { options: {} });
     await hooks["chat.params"](hookInput({ model: { providerID: "anthropic" } }), { options: {} });
-    assert.equal(warnings.length, 2, "one per provider, not one per request");
-    assert.match(warnings[0], /openai/);
-    assert.match(warnings[1], /anthropic/);
+    assert.deepEqual(warnings, [], "an unsupported provider is expected, not a fault");
   });
+});
+
+test("an unsupported provider is still explained in the debug log", async () => {
+  // Silent on stderr must not mean untraceable: an operator asking why their
+  // key never lands needs the answer in the one place they are told to look.
+  const dir = mkdtempSync(join(tmpdir(), "ctx-cache-absent-"));
+  try {
+    const logPath = join(dir, "context-cache.log");
+    await withEnv({ [DEBUG_ENV_VAR]: "1", [LOG_PATH_ENV_VAR]: logPath }, async () => {
+      const hooks = await OpenCodeContextCachePlugin(
+        { directory: "/srv/repo", worktree: "/srv/repo" },
+        quiet(),
+      );
+      await hooks["chat.params"](hookInput({ model: { providerID: "deepseek" } }), { options: {} });
+    });
+    const log = readFileSync(logPath, "utf8");
+    assert.match(log, /deepseek exposes no prompt cache key field/);
+    assert.match(log, /provider=deepseek applied=\[\] .*reason=no-fields/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("a foreign key warns once, and a mixed conflict is not hidden", async () => {
@@ -416,8 +440,11 @@ test("the provider label falls back to provider.info.id, then to unknown", async
       { directory: "/srv/repo", worktree: "/srv/repo" },
       { warn: (m) => warnings.push(m) },
     );
-    await hooks["chat.params"]({ sessionID: SESSION, provider: { info: { id: "via-info" } } }, { options: {} });
-    await hooks["chat.params"]({ sessionID: SESSION }, { options: {} });
+    // Observed through the foreign-key warning: the no-fields path is silent by
+    // design, so a label bug there would show up in no assertion at all.
+    const foreign = { options: { promptCacheKey: "set-by-someone-else" } };
+    await hooks["chat.params"]({ sessionID: SESSION, provider: { info: { id: "via-info" } } }, foreign);
+    await hooks["chat.params"]({ sessionID: SESSION }, foreign);
     assert.match(warnings[0], /provider via-info/);
     assert.match(warnings[1], /provider unknown/);
   });
