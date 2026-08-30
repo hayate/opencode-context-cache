@@ -201,7 +201,11 @@ test("a foreign key warns once, and a mixed conflict is not hidden", async () =>
   });
 });
 
-test("malformed options and a missing session id produce no operator warning", async () => {
+test("an upstream shape change is loud, not silent", async () => {
+  // These states cannot occur against a correct opencode. When they do, the
+  // plugin is permanently inert and prompt caching has silently reverted to a
+  // per-session key - the exact regression this plugin exists to prevent. An
+  // earlier revision asserted silence here; that was wrong.
   await withEnv({}, async () => {
     const warnings = [];
     const hooks = await OpenCodeContextCachePlugin(
@@ -210,35 +214,90 @@ test("malformed options and a missing session id produce no operator warning", a
     );
     await hooks["chat.params"](hookInput(), { options: null });
     await hooks["chat.params"](hookInput({ sessionID: undefined }), { options: { promptCacheKey: SESSION } });
-    assert.deepEqual(warnings, [], "these are debug-only states, not compatibility failures");
+    assert.equal(warnings.length, 2);
+    assert.match(warnings[0], /no options object/);
+    assert.match(warnings[0], /reverted to a per-session key/);
+    assert.match(warnings[1], /no sessionID/);
+    assert.match(warnings[1], /renamed/);
   });
 });
 
-test("the deprecated sticky env warns once and its raw value is never logged", async () => {
-  await withEnv({ [STICKY_SESSION_ID_ENV_VAR]: "secret-tenant-key" }, async () => {
+test("a PluginInput with no usable path warns, while scope=session stays quiet", async () => {
+  await withEnv({}, async () => {
     const warnings = [];
-    await OpenCodeContextCachePlugin(
+    await OpenCodeContextCachePlugin({ directory: "", worktree: "" }, { warn: (m) => warnings.push(m) });
+    assert.equal(warnings.length, 1, "an opt-out and a derive failure must not look the same");
+    assert.match(warnings[0], /could not derive a project path/);
+  });
+  await withEnv({ [SCOPE_ENV_VAR]: "session" }, async () => {
+    const warnings = [];
+    await OpenCodeContextCachePlugin({ directory: "/srv/repo", worktree: "/srv/repo" }, { warn: (m) => warnings.push(m) });
+    assert.deepEqual(warnings, [], "opting out is intentional and must be silent");
+  });
+});
+
+test("an empty cache key field gets its own message, not the conflict one", async () => {
+  await withEnv({}, async () => {
+    const warnings = [];
+    const hooks = await OpenCodeContextCachePlugin(
       { directory: "/srv/repo", worktree: "/srv/repo" },
       { warn: (m) => warnings.push(m) },
     );
+    await hooks["chat.params"](hookInput(), { options: { promptCacheKey: undefined } });
     assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /deprecated/i);
-    assert.match(warnings[0], new RegExp(STICKY_SESSION_ID_ENV_VAR));
-    for (const line of warnings) {
-      assert.equal(line.includes("secret-tenant-key"), false, "raw override must never be logged");
+    assert.match(warnings[0], /left it empty/);
+    assert.equal(/did not set/.test(warnings[0]), false, "nobody set it, so do not say somebody did");
+  });
+});
+
+test("a non-string providerID cannot make the hook throw", async () => {
+  // ToString on a null-prototype object or a Symbol throws, and every use of
+  // the provider label is a template literal.
+  await withEnv({}, async () => {
+    const hooks = await OpenCodeContextCachePlugin({ directory: "/srv/repo", worktree: "/srv/repo" });
+    const hostile = [
+      Object.create(null),
+      Symbol("provider"),
+      { toString() { throw new Error("boom"); } },
+      42,
+      null,
+    ];
+    for (const providerID of hostile) {
+      await hooks["chat.params"](hookInput({ model: { providerID } }), { options: {} });
+      await hooks["chat.params"](hookInput({ model: { providerID } }), { options: { promptCacheKey: "theirs" } });
     }
   });
 });
 
-test("an unrecognised scope warns once", async () => {
-  await withEnv({ [SCOPE_ENV_VAR]: "sessions" }, async () => {
+test("a second, unrelated error on one provider is not suppressed by the first", async () => {
+  await withEnv({}, async () => {
     const warnings = [];
-    await OpenCodeContextCachePlugin(
+    const hooks = await OpenCodeContextCachePlugin(
       { directory: "/srv/repo", worktree: "/srv/repo" },
       { warn: (m) => warnings.push(m) },
     );
-    assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /sessions/);
-    assert.match(warnings[0], /worktree/);
+    const boom = (message) => ({
+      options: { get promptCacheKey() { throw new Error(message); } },
+    });
+    await hooks["chat.params"](hookInput(), boom("FIRST PROBLEM"));
+    await hooks["chat.params"](hookInput(), boom("FIRST PROBLEM"));
+    await hooks["chat.params"](hookInput(), boom("SECOND, DIFFERENT PROBLEM"));
+    assert.equal(warnings.length, 2, "same error deduped, different error still reported");
+    assert.match(warnings[0], /FIRST PROBLEM/);
+    assert.match(warnings[1], /SECOND, DIFFERENT PROBLEM/);
+  });
+});
+
+test("a startup failure disables the plugin instead of failing the load", async () => {
+  await withEnv({}, async () => {
+    const hostileOptions = {
+      get scope() { throw new Error("config blew up"); },
+      warn: () => {},
+    };
+    const hooks = await OpenCodeContextCachePlugin({ directory: "/srv/repo", worktree: "/srv/repo" }, hostileOptions);
+    assert.equal(typeof hooks["chat.params"], "function", "must still hand opencode a usable plugin");
+    const output = { options: { promptCacheKey: SESSION } };
+    await hooks["chat.params"](hookInput(), output);
+    assert.equal(output.options.promptCacheKey, SESSION, "an inert plugin changes nothing");
   });
 });

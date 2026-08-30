@@ -19,7 +19,7 @@ test("strips the ses_ prefix only from a full lowercase 64-hex session id", () =
 test("replaces promptCacheKey when it holds core's session id", () => {
   const output = { options: { promptCacheKey: SESSION, store: false } };
   const r = applyCacheKey(output, KEY, SESSION);
-  assert.deepEqual(r, { appliedFields: ["promptCacheKey"], foreignFields: [], reason: null });
+  assert.deepEqual(r, { appliedFields: ["promptCacheKey"], foreignFields: [], emptyFields: [], reason: null });
   assert.equal(output.options.promptCacheKey, KEY);
   assert.equal(output.options.store, false);
 });
@@ -48,7 +48,7 @@ test("replaces both fields when both hold core's default", () => {
 test("leaves a value this plugin did not set and reports it", () => {
   const output = { options: { promptCacheKey: "someone-elses-key" } };
   const r = applyCacheKey(output, KEY, SESSION);
-  assert.deepEqual(r, { appliedFields: [], foreignFields: ["promptCacheKey"], reason: null });
+  assert.deepEqual(r, { appliedFields: [], foreignFields: ["promptCacheKey"], emptyFields: [], reason: null });
   assert.equal(output.options.promptCacheKey, "someone-elses-key");
 });
 
@@ -61,17 +61,21 @@ test("reports a foreign snake_case sibling alongside an applied camelCase field"
   assert.equal(output.options.prompt_cache_key, "theirs");
 });
 
-test("treats a present-but-undefined field as foreign, not as core's", () => {
-  const output = { options: { promptCacheKey: undefined } };
-  const r = applyCacheKey(output, KEY, SESSION);
-  assert.deepEqual(r.foreignFields, ["promptCacheKey"]);
-  assert.equal(output.options.promptCacheKey, undefined);
+test("reports a present-but-empty field as empty, not as someone else's key", () => {
+  for (const blank of [undefined, null]) {
+    const output = { options: { promptCacheKey: blank } };
+    const r = applyCacheKey(output, KEY, SESSION);
+    assert.deepEqual(r.emptyFields, ["promptCacheKey"], "an unset field was not set by a third party");
+    assert.deepEqual(r.foreignFields, [], "calling it foreign sends the operator hunting for a conflict");
+    assert.equal(r.reason, null);
+    assert.equal(output.options.promptCacheKey, blank, "provenance is still unproven, so do not write");
+  }
 });
 
 test("reports no-fields distinctly when core placed nothing", () => {
   const output = { options: { store: false } };
   const r = applyCacheKey(output, KEY, SESSION);
-  assert.deepEqual(r, { appliedFields: [], foreignFields: [], reason: "no-fields" });
+  assert.deepEqual(r, { appliedFields: [], foreignFields: [], emptyFields: [], reason: "no-fields" });
   assert.deepEqual(output.options, { store: false });
 });
 

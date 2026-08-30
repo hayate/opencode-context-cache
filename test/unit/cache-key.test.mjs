@@ -18,6 +18,7 @@ const {
   safeHostname,
   selectScopePath,
   sha256,
+  identityWarning,
 } = plugin.internals;
 
 const BASE = { user: "andrea", host: "moonveil", worktree: "/srv/repo", directory: "/srv/repo/pkg/a", env: {} };
@@ -166,4 +167,37 @@ test("safeHostname falls back when hostname throws or is empty", () => {
   assert.equal(safeHostname({ readHostname: () => { throw new Error("nope"); } }), "unknown-host");
   assert.equal(safeHostname({ readHostname: () => "" }), "unknown-host");
   assert.equal(safeHostname({ readHostname: () => "box" }), "box");
+});
+
+test("identityWarning fires only when a generated key rests on placeholder identity", () => {
+  assert.equal(identityWarning({ user: "andrea", host: "moonveil", sensitive: false }), null);
+  assert.equal(
+    identityWarning({ user: "unknown", host: "unknown-host", sensitive: true }),
+    null,
+    "an explicit override does not depend on local identity",
+  );
+
+  const noUser = identityWarning({ user: "unknown", host: "moonveil", sensitive: false });
+  assert.match(noUser, /could not determine the local username,/);
+  assert.match(noUser, /unknown@moonveil:<path>/);
+  assert.match(noUser, new RegExp(PROMPT_CACHE_KEY_ENV_VAR));
+
+  assert.match(
+    identityWarning({ user: "andrea", host: "unknown-host", sensitive: false }),
+    /could not determine the local hostname,/,
+  );
+  assert.match(
+    identityWarning({ user: "unknown", host: "unknown-host", sensitive: false }),
+    /could not determine the local username or hostname,/,
+  );
+});
+
+test("a placeholder identity is reachable from the real fallback paths", () => {
+  // Ties identityWarning to the functions that actually produce the sentinels,
+  // so renaming a sentinel in one place breaks this test rather than silently
+  // disabling the warning.
+  const boom = () => { throw new Error("no passwd entry"); };
+  const user = getUsername({ env: {}, readUserInfo: boom });
+  const host = safeHostname({ readHostname: boom });
+  assert.notEqual(identityWarning({ user, host, sensitive: false }), null);
 });

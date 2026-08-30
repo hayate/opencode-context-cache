@@ -124,11 +124,52 @@ function safeHostname({ readHostname = hostname } = {}) {
   }
 }
 
-function defaultLogPath(env = {}, home = homedir()) {
+function safeHomedir({ readHomedir = homedir } = {}) {
+  try {
+    return readHomedir() || "";
+  } catch {
+    // homedir throws in the same restricted environments userInfo does: no HOME
+    // and a getpwuid that fails, which is an ordinary container setup.
+    return "";
+  }
+}
+
+function defaultLogPath(env = {}, home) {
   const explicit = readEnv(env, LOG_PATH_ENV_VAR);
+  // Resolved lazily: as a default parameter this ran on every call, including
+  // when an explicit path made it irrelevant.
   if (explicit) return explicit;
-  const stateHome = readEnv(env, "XDG_STATE_HOME") || join(home, ".local", "state");
+  const stateHome = readEnv(env, "XDG_STATE_HOME") || join(home ?? safeHomedir(), ".local", "state");
   return join(stateHome, "opencode", "context-cache.log");
+}
+
+/**
+ * A generated key built on placeholder identity is not unique to this machine:
+ * every host that fails the same way, in the same project path, derives the
+ * same key. Returns the warning text, or null when identity is sound or the
+ * key does not depend on it.
+ */
+function identityWarning({ user, host, sensitive }) {
+  if (sensitive) return null;
+  const badUser = user === "unknown";
+  const badHost = host === "unknown-host";
+  if (!badUser && !badHost) return null;
+  const missing = badUser && badHost ? "username or hostname" : badUser ? "username" : "hostname";
+  return (
+    `could not determine the local ${missing}, so the cache key falls back to ` +
+    `"${user}@${host}:<path>". Every machine with the same failure and the same project path ` +
+    `will share it. Set ${PROMPT_CACHE_KEY_ENV_VAR} to pin a distinct key.`
+  );
+}
+
+/** Stringify a thrown value that we did not create, without throwing. */
+function describeError(error) {
+  try {
+    if (error instanceof Error) return `${error.name}: ${error.message}`;
+    return String(error);
+  } catch {
+    return "unstringifiable error";
+  }
 }
 
 function safeJson(value) {
@@ -150,8 +191,12 @@ function createLogger({ env = {}, filePath, write = appendFileSync, warn = conso
   function emit(message) {
     try {
       warn(`[context-cache] ${message}`);
+      return true;
     } catch {
-      // A failing warning sink must never escape into the request path.
+      // A failing warning sink must never escape into the request path. The
+      // caller declines to latch the key, so a sink that recovers still gets
+      // the message.
+      return false;
     }
   }
 
@@ -172,7 +217,10 @@ function createLogger({ env = {}, filePath, write = appendFileSync, warn = conso
         write(path, `[${new Date().toISOString()}] [pid:${process.pid}] [context-cache] ${body}\n`, "utf8");
       } catch (error) {
         fileUsable = false;
-        emit(`cannot write debug log at ${path}: ${error?.message ?? error}; debug logging disabled`);
+        emit(
+          `cannot write debug log at ${path}: ${describeError(error)}; debug logging disabled ` +
+            "for this process. Restart opencode after fixing it to re-enable.",
+        );
       }
     },
 
@@ -183,8 +231,13 @@ function createLogger({ env = {}, filePath, write = appendFileSync, warn = conso
      */
     warnOnce(key, message) {
       if (warned.has(key)) return false;
+      if (!emit(message)) return false;
       warned.add(key);
-      emit(message);
+      // The always-on channel writes to stderr, which under opencode's TUI can
+      // be redrawn away. Mirror it into the durable log so an operator who
+      // turns debug on gets a complete record rather than one with the
+      // warnings missing.
+      this.debug(`WARN ${message}`);
       return true;
     },
   };
@@ -210,15 +263,16 @@ function stripSesPrefix(sessionID) {
 function applyCacheKey(output, value, sessionID) {
   const options = output?.options;
   if (!options || typeof options !== "object") {
-    return { appliedFields: [], foreignFields: [], reason: "invalid-options" };
+    return { appliedFields: [], foreignFields: [], emptyFields: [], reason: "invalid-options" };
   }
   if (typeof sessionID !== "string" || sessionID === "") {
-    return { appliedFields: [], foreignFields: [], reason: "missing-session" };
+    return { appliedFields: [], foreignFields: [], emptyFields: [], reason: "missing-session" };
   }
 
   const stripped = stripSesPrefix(sessionID);
   const appliedFields = [];
   const foreignFields = [];
+  const emptyFields = [];
   const replacements = {};
 
   for (const field of CACHE_KEY_FIELDS) {
@@ -227,90 +281,173 @@ function applyCacheKey(output, value, sessionID) {
     if (current === sessionID || current === stripped) {
       replacements[field] = value;
       appliedFields.push(field);
+    } else if (current === undefined || current === null) {
+      // Present but unset. Provenance is still unproven so we must not write,
+      // but nobody "set" this, and saying so sends the operator hunting for a
+      // conflicting plugin that does not exist.
+      emptyFields.push(field);
     } else {
       foreignFields.push(field);
     }
   }
 
-  if (appliedFields.length === 0 && foreignFields.length === 0) {
-    return { appliedFields, foreignFields, reason: "no-fields" };
+  if (appliedFields.length === 0 && foreignFields.length === 0 && emptyFields.length === 0) {
+    return { appliedFields, foreignFields, emptyFields, reason: "no-fields" };
   }
   if (appliedFields.length > 0) output.options = { ...options, ...replacements };
-  return { appliedFields, foreignFields, reason: null };
+  return { appliedFields, foreignFields, emptyFields, reason: null };
 }
 
 const OpenCodeContextCachePlugin = async (input = {}, options = {}) => {
-  const env = process.env;
-  const logger = createLogger({ env, warn: typeof options?.warn === "function" ? options.warn : undefined });
-  const resolved = resolveCacheKey({
-    env,
-    options,
-    worktree: input?.worktree,
-    directory: input?.directory,
-    user: getUsername({ env }),
-    host: safeHostname(),
-  });
-
-  if (resolved?.unknownScope) {
-    logger.warnOnce(
-      "scope",
-      `unrecognised ${SCOPE_ENV_VAR} value "${resolved.unknownScope}"; expected one of ` +
-        `${SCOPES.join(", ")}. Falling back to worktree scope.`,
+  // The whole factory is guarded. An unguarded throw here rejects the promise
+  // opencode is awaiting, so the plugin fails to load outright - strictly worse
+  // than loading and doing nothing.
+  try {
+    const env = process.env;
+    const logger = createLogger({ env, warn: typeof options?.warn === "function" ? options.warn : undefined });
+    const user = getUsername({ env });
+    const host = safeHostname();
+    const { scope } = parseScope(
+      readEnv(env, SCOPE_ENV_VAR) || (typeof options?.scope === "string" ? options.scope : ""),
     );
-  }
-  if (resolved?.deprecated) {
-    logger.warnOnce(
-      "deprecated-env",
-      `${STICKY_SESSION_ID_ENV_VAR} is deprecated; use ${PROMPT_CACHE_KEY_ENV_VAR} instead.`,
-    );
-  }
+    const resolved = resolveCacheKey({
+      env,
+      options,
+      worktree: input?.worktree,
+      directory: input?.directory,
+      user,
+      host,
+    });
 
-  if (!resolved) logger.debug("no stable cache key resolved; leaving opencode's session default in place");
-  else {
-    logger.debug(
-      `cache key source=${resolved.source} hashed=${resolved.hashed}`,
-      // Never log the raw value of an operator-supplied override: it may carry
-      // a tenant name or a secret pasted into the env var by mistake.
-      resolved.sensitive ? `fingerprint=${fingerprint(resolved.raw)}` : `raw=${resolved.raw}`,
-    );
-  }
+    if (resolved?.unknownScope) {
+      logger.warnOnce(
+        "scope",
+        `unrecognised ${SCOPE_ENV_VAR} value "${resolved.unknownScope}"; expected one of ` +
+          `${SCOPES.join(", ")}. Falling back to worktree scope.`,
+      );
+    }
+    if (resolved?.deprecated) {
+      logger.warnOnce(
+        "deprecated-env",
+        `${STICKY_SESSION_ID_ENV_VAR} is deprecated; use ${PROMPT_CACHE_KEY_ENV_VAR} instead.`,
+      );
+    }
+    const identityIssue = resolved && identityWarning({ user, host, sensitive: resolved.sensitive });
+    if (identityIssue) logger.warnOnce("identity-fallback", identityIssue);
 
-  return {
-    "chat.params": async (hookInput, output) => {
-      if (!resolved) return;
-      // Everything, including reading the provider label off possibly hostile
-      // input, sits inside the try. A cache optimization must never be able to
-      // fail the user's request.
-      let provider = "unknown";
-      try {
-        provider = hookInput?.model?.providerID ?? hookInput?.provider?.info?.id ?? "unknown";
-        const { appliedFields, foreignFields, reason } = applyCacheKey(output, resolved.value, hookInput?.sessionID);
-
-        if (foreignFields.length > 0) {
-          logger.warnOnce(
-            `foreign:${provider}:${foreignFields.join(",")}`,
-            `provider ${provider} carries a prompt cache key this plugin did not set ` +
-              `(${foreignFields.join(", ")}); leaving those fields unchanged.`,
-          );
-        }
-        if (reason === "no-fields") {
-          logger.warnOnce(
-            `absent:${provider}`,
-            `provider ${provider} exposes no prompt cache key field, so none was applied. ` +
-              "This is expected for providers that do not support one; if it used to work, " +
-              "opencode may have renamed the field.",
-          );
-          return;
-        }
-        logger.debug(
-          `provider=${provider} applied=[${appliedFields.join(",")}] ` +
-            `foreign=[${foreignFields.join(",")}] reason=${reason ?? "none"}`,
+    if (!resolved) {
+      if (scope === "session") {
+        logger.debug(`${SCOPE_ENV_VAR}=session: opted out, leaving opencode's session default in place`);
+      } else {
+        // Not an opt-out: we were asked for a stable key and could not build
+        // one. Silently reverting to a per-session key is the exact regression
+        // this plugin exists to prevent.
+        logger.warnOnce(
+          "no-path",
+          `could not derive a project path from opencode's PluginInput ` +
+            `(worktree=${safeJson(input?.worktree)}, directory=${safeJson(input?.directory)}), ` +
+            `so no stable cache key was set and prompt caching stays per-session. ` +
+            `Set ${PROMPT_CACHE_KEY_ENV_VAR} to pin one explicitly.`,
         );
-      } catch (error) {
-        logger.warnOnce(`error:${provider}`, `unexpected error applying cache key: ${error?.stack ?? error}`);
       }
-    },
-  };
+    } else {
+      logger.debug(
+        `cache key source=${resolved.source} hashed=${resolved.hashed}`,
+        // Never log the raw value of an operator-supplied override: it may carry
+        // a tenant name or a secret pasted into the env var by mistake.
+        resolved.sensitive ? `fingerprint=${fingerprint(resolved.raw)}` : `raw=${resolved.raw}`,
+      );
+    }
+
+    return {
+      "chat.params": async (hookInput, output) => {
+        if (!resolved) return;
+        let provider = "unknown";
+        try {
+          // Coerced, not just read: every use below is a template literal, and
+          // ToString on a null-prototype object or a Symbol throws.
+          const label = hookInput?.model?.providerID ?? hookInput?.provider?.info?.id;
+          provider = typeof label === "string" && label !== "" ? label : "unknown";
+
+          const { appliedFields, foreignFields, emptyFields, reason } = applyCacheKey(
+            output,
+            resolved.value,
+            hookInput?.sessionID,
+          );
+
+          // invalid-options and missing-session cannot happen against a correct
+          // opencode. When they do, the shape upstream changed and the plugin is
+          // permanently inert, so they are exactly the states that must be loud.
+          if (reason === "invalid-options") {
+            logger.warnOnce(
+              `invalid-options:${provider}`,
+              "opencode gave this hook no options object to write to, so no cache key was applied. " +
+                "This should not happen: opencode may have changed the chat.params output shape. " +
+                "Prompt caching has reverted to a per-session key.",
+            );
+          } else if (reason === "missing-session") {
+            logger.warnOnce(
+              `missing-session:${provider}`,
+              "opencode gave this hook no sessionID, so the cache key's provenance could not be " +
+                "checked and nothing was changed. This should not happen: opencode may have renamed " +
+                "the field. Prompt caching has reverted to a per-session key.",
+            );
+          } else if (reason === "no-fields") {
+            logger.warnOnce(
+              `absent:${provider}`,
+              `provider ${provider} exposes no prompt cache key field, so none was applied. ` +
+                "This is expected for providers that do not support one; if it used to work, " +
+                "opencode may have renamed the field.",
+            );
+          }
+
+          if (foreignFields.length > 0) {
+            logger.warnOnce(
+              `foreign:${provider}:${foreignFields.join(",")}`,
+              `provider ${provider} carries a prompt cache key this plugin did not set ` +
+                `(${foreignFields.join(", ")}); leaving those fields unchanged.`,
+            );
+          }
+          if (emptyFields.length > 0) {
+            logger.warnOnce(
+              `empty:${provider}:${emptyFields.join(",")}`,
+              `provider ${provider} exposes ${emptyFields.join(", ")} but opencode left it empty, ` +
+                "so provenance could not be confirmed and no key was applied. If caching used to " +
+                "work here, opencode may have changed how it seeds this field.",
+            );
+          }
+
+          // Runs for every outcome: a debug log that goes quiet on the no-fields
+          // path cannot be told apart from a hook that is not running at all.
+          logger.debug(
+            `provider=${provider} applied=[${appliedFields.join(",")}] ` +
+              `foreign=[${foreignFields.join(",")}] empty=[${emptyFields.join(",")}] ` +
+              `reason=${reason ?? "none"}`,
+          );
+        } catch (error) {
+          // Last resort. Bounded by the error text so a second, unrelated
+          // failure on the same provider is not suppressed forever, and itself
+          // wrapped because there is nothing left to fall back to.
+          try {
+            const what = describeError(error);
+            logger.warnOnce(
+              `error:${provider}:${what.slice(0, 120)}`,
+              `unexpected error applying cache key: ${what}`,
+            );
+          } catch {
+            // Nothing further to try; the request must still proceed.
+          }
+        }
+      },
+    };
+  } catch (error) {
+    try {
+      console.warn(`[context-cache] disabled by an unexpected startup error: ${describeError(error)}`);
+    } catch {
+      // Nothing further to try; opencode must still get a usable plugin.
+    }
+    return { "chat.params": async () => {} };
+  }
 };
 
 /**
@@ -352,7 +489,10 @@ OpenCodeContextCachePlugin.internals = Object.freeze({
   resolveCacheKey,
   getUsername,
   safeHostname,
+  safeHomedir,
+  identityWarning,
   defaultLogPath,
+  describeError,
   createLogger,
   stripSesPrefix,
   applyCacheKey,

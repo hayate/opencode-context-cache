@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 
 import plugin from "../../plugins/opencode-context-cache.mjs";
 
-const { DEBUG_ENV_VAR, LOG_PATH_ENV_VAR, createLogger, defaultLogPath, fingerprint } = plugin.internals;
+const { DEBUG_ENV_VAR, LOG_PATH_ENV_VAR, createLogger, defaultLogPath, fingerprint, safeHomedir } =
+  plugin.internals;
 
 const temps = [];
 function tempDir() {
@@ -90,8 +91,43 @@ test("a throwing warn sink cannot escape", () => {
     write: () => { throw new Error("EACCES"); },
     warn: () => { throw new Error("stderr is gone"); },
   });
-  logger.debug("boom");
-  assert.equal(logger.warnOnce("k", "m"), true);
+  assert.doesNotThrow(() => logger.debug("boom"));
+  assert.doesNotThrow(() => logger.warnOnce("k", "m"));
+});
+
+test("a warning that could not be delivered is not marked as spent", () => {
+  const delivered = [];
+  let sinkUp = false;
+  const logger = createLogger({
+    env: {},
+    filePath: "/unused",
+    warn: (m) => {
+      if (!sinkUp) throw new Error("stderr is gone");
+      delivered.push(m);
+    },
+  });
+  assert.equal(logger.warnOnce("k", "important"), false, "not delivered, so not spent");
+  sinkUp = true;
+  assert.equal(logger.warnOnce("k", "important"), true, "a recovered sink still gets the message");
+  assert.deepEqual(delivered, ["[context-cache] important"]);
+  assert.equal(logger.warnOnce("k", "important"), false, "and only once thereafter");
+});
+
+test("warnings are mirrored into the debug log so it is a complete record", () => {
+  const path = join(tempDir(), "context-cache.log");
+  const logger = createLogger({ env: { [DEBUG_ENV_VAR]: "1" }, filePath: path, warn: () => {} });
+  logger.warnOnce("k", "something the operator needs");
+  assert.match(readFileSync(path, "utf8"), /WARN something the operator needs/);
+});
+
+test("safeHomedir survives a throwing homedir, and an explicit path never calls it", () => {
+  assert.equal(safeHomedir({ readHomedir: () => { throw new Error("no passwd entry"); } }), "");
+  assert.equal(safeHomedir({ readHomedir: () => "" }), "");
+  let called = 0;
+  const path = defaultLogPath({ [LOG_PATH_ENV_VAR]: "/custom/x.log" }, (() => { called++; return "/h"; })());
+  assert.equal(path, "/custom/x.log");
+  assert.equal(called, 1, "the caller evaluated its own argument; the point is the default no longer does");
+  assert.doesNotThrow(() => defaultLogPath({}));
 });
 
 test("warnOnce deduplicates by key and ignores the debug flag", () => {

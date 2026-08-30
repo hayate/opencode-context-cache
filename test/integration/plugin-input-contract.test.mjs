@@ -105,7 +105,7 @@ async function probe(directories, cwd) {
       });
       assert.ok(res.ok, `instance request for ${dir} failed with ${res.status}`);
     }
-    await sleep(1000);
+    await sleep(0);
     const raw = existsSync(out) ? readFileSync(out, "utf8").trim() : "";
     return raw ? raw.split("\n").filter(Boolean).map((l) => JSON.parse(l)) : [];
   } finally {
